@@ -2252,19 +2252,44 @@ public sealed partial class CoreDataStore
         return changed;
     }
 
-    public async Task<HubMemberRecord?> CreateHubMemberAsync(HubPrincipalRecord principal, JsonElement body, CancellationToken cancellationToken)
+    public async Task<HubMemberRecord?> CreateHubMemberAsync(
+        HubPrincipalRecord principal,
+        JsonElement body,
+        string requestId,
+        CancellationToken cancellationToken)
     {
         var email = RequiredJsonString(body, "email", 320).ToLowerInvariant();
         var roleCode = (JsonString(body, "role") ?? "STAFF").Trim().ToUpperInvariant();
-        var storeIds = JsonGuidArray(body, "storeIds");
-        var applicationCodes = JsonStringArray(body, "applicationCodes")
-            .Concat(JsonStringArray(body, "applications"))
-            .Select(value => value.Trim().ToUpperInvariant())
-            .Where(value => ApplicationCodes.All.Contains(value) && value is not "HUB" and not "ADMIN")
-            .Distinct(StringComparer.Ordinal)
-            .ToArray();
+        var storeIds = HubMemberAssignmentPolicy.ReadStoreIds(body);
+        var applicationCodes = HubMemberAssignmentPolicy.ReadApplicationCodes(body);
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await TenantContextSql.ApplyAsync(
+            connection,
+            transaction,
+            principal.UserId,
+            principal.OrganizationId,
+            null,
+            "HUB",
+            null,
+            cancellationToken);
+
+        if (storeIds.Length > 0 || applicationCodes.Length > 0)
+        {
+            var actorStoreIds = await ReadHubMembershipStoreIdsAsync(connection, transaction, principal.MembershipId, cancellationToken);
+            var organizationStoreIds = await ReadActiveOrganizationStoreIdsAsync(
+                connection,
+                transaction,
+                principal.OrganizationId,
+                storeIds,
+                cancellationToken);
+            HubMemberAssignmentPolicy.ValidateStoreScope(
+                principal.Role,
+                actorStoreIds,
+                organizationStoreIds,
+                storeIds);
+        }
+
         Guid userId;
         await using (var user = new NpgsqlCommand("select id from public.user_profiles where lower(email)=@email", connection, transaction))
         {
@@ -2332,6 +2357,27 @@ public sealed partial class CoreDataStore
 
         }
 
+        if (applicationCodes.Length > 0)
+        {
+            var auditMetadata = JsonSerializer.SerializeToElement(new
+            {
+                requestId,
+                applicationCodes,
+                requestedStoreIds = storeIds,
+                status = "ACTIVE"
+            });
+            await InsertHubAuditLogAsync(
+                connection,
+                transaction,
+                principal.OrganizationId,
+                principal.UserId,
+                "MEMBER_APPLICATION_ASSIGNMENT_CREATED",
+                "member_application_assignment",
+                membershipId,
+                auditMetadata,
+                cancellationToken);
+        }
+
         await transaction.CommitAsync(cancellationToken);
         InvalidateAuthorizationCaches();
         return (await ListHubMembersAsync(principal, cancellationToken)).FirstOrDefault(member => member.MembershipId == membershipId);
@@ -2340,6 +2386,16 @@ public sealed partial class CoreDataStore
     public async Task<JsonElement> ListHubMemberAssignmentsAsync(HubPrincipalRecord principal, Guid membershipId, CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await TenantContextSql.ApplyAsync(
+            connection,
+            transaction,
+            principal.UserId,
+            principal.OrganizationId,
+            null,
+            "HUB",
+            null,
+            cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             select coalesce(jsonb_agg(jsonb_build_object(
@@ -2357,6 +2413,11 @@ public sealed partial class CoreDataStore
                   and scoped.app_code = a.app_code
                   and scoped.store_id is not null
                   and scoped.status = 'active'
+                  and (@global_access or exists (
+                    select 1 from public.membership_stores actor_scope
+                    where actor_scope.membership_id = @actor_membership_id
+                      and actor_scope.store_id = scoped.store_id
+                  ))
               ), '[]'::jsonb)
             ) order by a.app_code), '[]'::jsonb)
             from (
@@ -2372,18 +2433,38 @@ public sealed partial class CoreDataStore
               join public.memberships m on m.user_id = aa.user_id and m.organization_id = aa.organization_id
               where m.id = @membership_id
                 and m.organization_id = @organization_id
+                and (@global_access or exists (
+                  select 1 from public.membership_stores actor_scope
+                  where actor_scope.membership_id = @actor_membership_id
+                    and actor_scope.store_id = aa.store_id
+                ))
               group by aa.user_id, aa.organization_id, aa.app_code
             ) a
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("membership_id", membershipId);
         command.Parameters.AddWithValue("organization_id", principal.OrganizationId);
-        return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "[]");
+        command.Parameters.AddWithValue("actor_membership_id", principal.MembershipId);
+        command.Parameters.AddWithValue("global_access", HubMemberAssignmentPolicy.IsOrganizationWideRole(principal.Role));
+        var assignments = ParseJson(await command.ExecuteScalarAsync(cancellationToken), "[]");
+        await transaction.CommitAsync(cancellationToken);
+        return assignments;
     }
 
     public async Task<JsonElement> ListHubMemberAssignmentsAsync(HubPrincipalRecord principal, CancellationToken cancellationToken)
     {
         await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await TenantContextSql.ApplyAsync(
+            connection,
+            transaction,
+            principal.UserId,
+            principal.OrganizationId,
+            null,
+            "HUB",
+            null,
+            cancellationToken);
         await using var command = new NpgsqlCommand(
             """
             select coalesce(jsonb_agg(jsonb_build_object(
@@ -2401,6 +2482,11 @@ public sealed partial class CoreDataStore
                   and scoped.app_code = a.app_code
                   and scoped.store_id is not null
                   and scoped.status = 'active'
+                  and (@global_access or exists (
+                    select 1 from public.membership_stores actor_scope
+                    where actor_scope.membership_id = @actor_membership_id
+                      and actor_scope.store_id = scoped.store_id
+                  ))
               ), '[]'::jsonb)
             ) order by a.membership_id, a.app_code), '[]'::jsonb)
             from (
@@ -2416,60 +2502,109 @@ public sealed partial class CoreDataStore
               from aevo_application_assignments aa
               join public.memberships m on m.user_id = aa.user_id and m.organization_id = aa.organization_id
               where m.organization_id = @organization_id
+                and (@global_access or exists (
+                  select 1 from public.membership_stores actor_scope
+                  where actor_scope.membership_id = @actor_membership_id
+                    and actor_scope.store_id = aa.store_id
+                ))
               group by m.id, aa.user_id, aa.organization_id, aa.app_code
             ) a
             """,
-            connection);
+            connection,
+            transaction);
         command.Parameters.AddWithValue("organization_id", principal.OrganizationId);
-        return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "[]");
+        command.Parameters.AddWithValue("actor_membership_id", principal.MembershipId);
+        command.Parameters.AddWithValue("global_access", HubMemberAssignmentPolicy.IsOrganizationWideRole(principal.Role));
+        var assignments = ParseJson(await command.ExecuteScalarAsync(cancellationToken), "[]");
+        await transaction.CommitAsync(cancellationToken);
+        return assignments;
     }
 
-    public async Task<JsonElement?> UpdateHubMemberAssignmentAsync(HubPrincipalRecord principal, Guid membershipId, string applicationCode, JsonElement body, CancellationToken cancellationToken)
+    public async Task<JsonElement?> UpdateHubMemberAssignmentAsync(
+        HubPrincipalRecord principal,
+        Guid membershipId,
+        string applicationCode,
+        JsonElement body,
+        string requestId,
+        CancellationToken cancellationToken)
     {
-        var normalizedApplication = applicationCode.Trim().ToUpperInvariant();
-        if (!ApplicationCodes.All.Contains(normalizedApplication)) return null;
-        var status = JsonString(body, "status")?.Trim().ToUpperInvariant() ?? "ACTIVE";
-        var storeIds = JsonGuidArray(body, "storeIds");
+        var normalizedApplication = HubMemberAssignmentPolicy.NormalizeApplicationCode(applicationCode);
+        var status = HubMemberAssignmentPolicy.ReadAssignmentStatus(body);
+        var storeIds = HubMemberAssignmentPolicy.ReadStoreIds(body);
+        var isOrganizationWide = HubMemberAssignmentPolicy.IsOrganizationWideRole(principal.Role);
+
         await using var connection = await OpenConnectionAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await TenantContextSql.ApplyAsync(
+            connection,
+            transaction,
+            principal.UserId,
+            principal.OrganizationId,
+            null,
+            "HUB",
+            null,
+            cancellationToken);
 
+        Guid userId;
         await using (var membership = new NpgsqlCommand(
-            "select 1 from public.memberships where id=@membership_id and organization_id=@organization_id",
+            "select user_id from public.memberships where id=@membership_id and organization_id=@organization_id for update",
             connection,
             transaction))
         {
             membership.Parameters.AddWithValue("membership_id", membershipId);
             membership.Parameters.AddWithValue("organization_id", principal.OrganizationId);
-            if (await membership.ExecuteScalarAsync(cancellationToken) is null)
+            var value = await membership.ExecuteScalarAsync(cancellationToken);
+            if (value is not Guid targetUserId)
             {
                 await transaction.RollbackAsync(cancellationToken);
                 return null;
             }
+
+            userId = targetUserId;
         }
 
-        foreach (var storeId in storeIds)
-        {
-            await using var store = new NpgsqlCommand(
-                "select 1 from public.stores where id=@store_id and organization_id=@organization_id and status='ACTIVE'",
-                connection,
-                transaction);
-            store.Parameters.AddWithValue("store_id", storeId);
-            store.Parameters.AddWithValue("organization_id", principal.OrganizationId);
-            if (await store.ExecuteScalarAsync(cancellationToken) is null)
-            {
-                await transaction.RollbackAsync(cancellationToken);
-                return null;
-            }
-        }
+        var actorStoreIds = await ReadHubMembershipStoreIdsAsync(connection, transaction, principal.MembershipId, cancellationToken);
+        var organizationStoreIds = await ReadActiveOrganizationStoreIdsAsync(
+            connection,
+            transaction,
+            principal.OrganizationId,
+            storeIds,
+            cancellationToken);
+        HubMemberAssignmentPolicy.ValidateStoreScope(
+            principal.Role,
+            actorStoreIds,
+            organizationStoreIds,
+            storeIds);
+
+        var beforeState = await ReadHubMemberApplicationAssignmentStateAsync(
+            connection,
+            transaction,
+            principal,
+            userId,
+            normalizedApplication,
+            cancellationToken);
 
         await using (var disable = new NpgsqlCommand(
-            "update aevo_application_assignments set status='disabled', updated_at=now() where user_id=(select user_id from public.memberships where id=@membership_id and organization_id=@organization_id) and organization_id=@organization_id and app_code=@application_code",
+            """
+            update aevo_application_assignments aa
+            set status='disabled', updated_at=now()
+            where aa.user_id=@user_id
+              and aa.organization_id=@organization_id
+              and aa.app_code=@application_code
+              and (@global_access or exists (
+                select 1 from public.membership_stores actor_scope
+                where actor_scope.membership_id=@actor_membership_id
+                  and actor_scope.store_id=aa.store_id
+              ))
+            """,
             connection,
             transaction))
         {
-            disable.Parameters.AddWithValue("membership_id", membershipId);
+            disable.Parameters.AddWithValue("user_id", userId);
             disable.Parameters.AddWithValue("organization_id", principal.OrganizationId);
             disable.Parameters.AddWithValue("application_code", normalizedApplication);
+            disable.Parameters.AddWithValue("actor_membership_id", principal.MembershipId);
+            disable.Parameters.AddWithValue("global_access", isOrganizationWide);
             await disable.ExecuteNonQueryAsync(cancellationToken);
         }
 
@@ -2500,6 +2635,33 @@ public sealed partial class CoreDataStore
                 cancellationToken);
         }
 
+        var afterState = await ReadHubMemberApplicationAssignmentStateAsync(
+            connection,
+            transaction,
+            principal,
+            userId,
+            normalizedApplication,
+            cancellationToken);
+        var auditMetadata = JsonSerializer.SerializeToElement(new
+        {
+            requestId,
+            applicationCode = normalizedApplication,
+            status,
+            requestedStoreIds = storeIds,
+            before = beforeState,
+            after = afterState
+        });
+        await InsertHubAuditLogAsync(
+            connection,
+            transaction,
+            principal.OrganizationId,
+            principal.UserId,
+            "MEMBER_APPLICATION_ASSIGNMENT_UPDATED",
+            "member_application_assignment",
+            membershipId,
+            auditMetadata,
+            cancellationToken);
+
         await transaction.CommitAsync(cancellationToken);
         InvalidateAuthorizationCaches();
         var assignments = await ListHubMemberAssignmentsAsync(principal, membershipId, cancellationToken);
@@ -2513,6 +2675,127 @@ public sealed partial class CoreDataStore
             }
         }
         return null;
+    }
+
+    public async Task RecordHubMemberAssignmentAttemptAsync(
+        HubPrincipalRecord principal,
+        Guid? membershipId,
+        string applicationCode,
+        string reasonCode,
+        string requestId,
+        CancellationToken cancellationToken)
+    {
+        var boundedApplicationCode = applicationCode.Trim().ToUpperInvariant();
+        if (boundedApplicationCode.Length > 64) boundedApplicationCode = boundedApplicationCode[..64];
+        var boundedReasonCode = reasonCode.Trim();
+        if (boundedReasonCode.Length > 64) boundedReasonCode = boundedReasonCode[..64];
+        var resourceId = membershipId ?? principal.OrganizationId;
+        var resourceType = membershipId is null
+            ? "member_application_assignment_request"
+            : "member_application_assignment";
+        var metadata = JsonSerializer.SerializeToElement(new
+        {
+            requestId,
+            applicationCode = boundedApplicationCode,
+            reasonCode = boundedReasonCode,
+            outcome = "DENIED"
+        });
+
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
+        await TenantContextSql.ApplyAsync(
+            connection,
+            transaction,
+            principal.UserId,
+            principal.OrganizationId,
+            null,
+            "HUB",
+            null,
+            cancellationToken);
+        await InsertHubAuditLogAsync(
+            connection,
+            transaction,
+            principal.OrganizationId,
+            principal.UserId,
+            "MEMBER_APPLICATION_ASSIGNMENT_DENIED",
+            resourceType,
+            resourceId,
+            metadata,
+            cancellationToken);
+        await transaction.CommitAsync(cancellationToken);
+    }
+
+    private static async Task<HashSet<Guid>> ReadHubMembershipStoreIdsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        Guid membershipId,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            "select coalesce(array_agg(store_id), '{}'::uuid[]) from public.membership_stores where membership_id=@membership_id",
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("membership_id", membershipId);
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is Guid[] storeIds ? storeIds.ToHashSet() : [];
+    }
+
+    private static async Task<HashSet<Guid>> ReadActiveOrganizationStoreIdsAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        Guid organizationId,
+        Guid[] requestedStoreIds,
+        CancellationToken cancellationToken)
+    {
+        if (requestedStoreIds.Length == 0) return [];
+        await using var command = new NpgsqlCommand(
+            "select coalesce(array_agg(id), '{}'::uuid[]) from public.stores where organization_id=@organization_id and status='ACTIVE' and id=any(@store_ids)",
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("organization_id", organizationId);
+        command.Parameters.Add(new NpgsqlParameter("store_ids", NpgsqlDbType.Array | NpgsqlDbType.Uuid)
+        {
+            Value = requestedStoreIds.ToArray()
+        });
+        var value = await command.ExecuteScalarAsync(cancellationToken);
+        return value is Guid[] storeIds ? storeIds.ToHashSet() : [];
+    }
+
+    private static async Task<JsonElement> ReadHubMemberApplicationAssignmentStateAsync(
+        NpgsqlConnection connection,
+        NpgsqlTransaction transaction,
+        HubPrincipalRecord principal,
+        Guid userId,
+        string applicationCode,
+        CancellationToken cancellationToken)
+    {
+        await using var command = new NpgsqlCommand(
+            """
+            select coalesce(jsonb_agg(jsonb_build_object(
+              'storeId', aa.store_id,
+              'status', upper(aa.status),
+              'permissions', aa.permissions,
+              'startsAt', aa.starts_at,
+              'expiresAt', aa.expires_at
+            ) order by aa.store_id nulls first), '[]'::jsonb)::text
+            from aevo_application_assignments aa
+            where aa.user_id=@user_id
+              and aa.organization_id=@organization_id
+              and aa.app_code=@application_code
+              and (@global_access or exists (
+                select 1 from public.membership_stores actor_scope
+                where actor_scope.membership_id=@actor_membership_id
+                  and actor_scope.store_id=aa.store_id
+              ))
+            """,
+            connection,
+            transaction);
+        command.Parameters.AddWithValue("user_id", userId);
+        command.Parameters.AddWithValue("organization_id", principal.OrganizationId);
+        command.Parameters.AddWithValue("application_code", applicationCode);
+        command.Parameters.AddWithValue("actor_membership_id", principal.MembershipId);
+        command.Parameters.AddWithValue("global_access", HubMemberAssignmentPolicy.IsOrganizationWideRole(principal.Role));
+        return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "[]");
     }
 
     public async Task<JsonElement> GetHubEntitlementsAsync(Guid organizationId, string? appId, Guid? storeId, CancellationToken cancellationToken)
