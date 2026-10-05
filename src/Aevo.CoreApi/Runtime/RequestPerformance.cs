@@ -10,11 +10,13 @@ public sealed record RequestPerformanceSnapshot(
     double AuthorizationMilliseconds,
     double DatabaseWallMilliseconds,
     double DatabaseAggregateMilliseconds,
+    double DatabaseConnectionOpenMilliseconds,
     double ExternalApiMilliseconds,
     double SerializationMilliseconds,
     double CacheLookupMilliseconds,
     int DatabaseQueryCount,
-    string CacheStatus);
+    string CacheStatus,
+    string DatabaseOperationBreakdown);
 
 /// <summary>
 /// Request-local performance data. It deliberately contains timings and
@@ -30,7 +32,9 @@ public sealed class RequestPerformanceContext(string requestId)
     private readonly object cacheLock = new();
     private int databaseQueryCount;
     private double databaseAggregateMilliseconds;
+    private double databaseConnectionOpenMilliseconds;
     private readonly List<(long StartTimestamp, long EndTimestamp)> databaseSpans = [];
+    private readonly Dictionary<string, double> databaseOperations = new(StringComparer.Ordinal);
     private double cacheLookupMilliseconds;
 
     public string RequestId { get; } = requestId;
@@ -45,14 +49,24 @@ public sealed class RequestPerformanceContext(string requestId)
         });
     }
 
-    public void RecordDatabase(double milliseconds, long startTimestamp, long endTimestamp)
+    public void RecordDatabase(string operation, double milliseconds, long startTimestamp, long endTimestamp)
     {
         Interlocked.Increment(ref databaseQueryCount);
         lock (databaseLock)
         {
             databaseAggregateMilliseconds += milliseconds;
             databaseSpans.Add((startTimestamp, endTimestamp));
+            var normalizedOperation = string.IsNullOrWhiteSpace(operation) ? "unknown" : operation.Trim();
+            databaseOperations[normalizedOperation] = databaseOperations.GetValueOrDefault(normalizedOperation) + milliseconds;
         }
+    }
+
+    public void RecordDatabase(double milliseconds, long startTimestamp, long endTimestamp)
+        => RecordDatabase("unknown", milliseconds, startTimestamp, endTimestamp);
+
+    public void RecordDatabaseConnectionOpen(double milliseconds)
+    {
+        lock (databaseLock) databaseConnectionOpenMilliseconds += milliseconds;
     }
 
     public void RecordCacheLookup(double milliseconds)
@@ -74,10 +88,17 @@ public sealed class RequestPerformanceContext(string requestId)
         var externalApi = phases.GetValueOrDefault("external_api");
         List<(long StartTimestamp, long EndTimestamp)> spans;
         double databaseAggregate;
+        double databaseConnectionOpen;
+        string databaseOperationBreakdown;
         lock (databaseLock)
         {
             spans = [.. databaseSpans];
             databaseAggregate = databaseAggregateMilliseconds;
+            databaseConnectionOpen = databaseConnectionOpenMilliseconds;
+            databaseOperationBreakdown = string.Join(",", databaseOperations
+                .OrderByDescending(entry => entry.Value)
+                .Select(entry => $"{entry.Key}={entry.Value.ToString("F2", System.Globalization.CultureInfo.InvariantCulture)}")
+                .Take(12));
         }
 
         var databaseWall = DatabaseWallMilliseconds(spans);
@@ -99,11 +120,13 @@ public sealed class RequestPerformanceContext(string requestId)
             Math.Round(authorization, 2),
             Math.Round(databaseWall, 2),
             Math.Round(databaseAggregate, 2),
+            Math.Round(databaseConnectionOpen, 2),
             Math.Round(externalApi, 2),
             Math.Round(serialization, 2),
             Math.Round(cacheLookup, 2),
             Volatile.Read(ref databaseQueryCount),
-            cacheStatus);
+            cacheStatus,
+            databaseOperationBreakdown);
     }
 
     private static double DatabaseWallMilliseconds(List<(long StartTimestamp, long EndTimestamp)> spans)
@@ -200,7 +223,7 @@ public static class RequestPerformance
         finally
         {
             stopwatch.Stop();
-            Current?.RecordDatabase(stopwatch.Elapsed.TotalMilliseconds, startTimestamp, Stopwatch.GetTimestamp());
+            Current?.RecordDatabase(operation, stopwatch.Elapsed.TotalMilliseconds, startTimestamp, Stopwatch.GetTimestamp());
         }
     }
 
@@ -215,7 +238,7 @@ public static class RequestPerformance
         finally
         {
             stopwatch.Stop();
-            Current?.RecordDatabase(stopwatch.Elapsed.TotalMilliseconds, startTimestamp, Stopwatch.GetTimestamp());
+            Current?.RecordDatabase(operation, stopwatch.Elapsed.TotalMilliseconds, startTimestamp, Stopwatch.GetTimestamp());
         }
     }
 

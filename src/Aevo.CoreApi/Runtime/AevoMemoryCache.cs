@@ -6,6 +6,10 @@ namespace Aevo.CoreApi.Runtime;
 public static class AevoCacheKeys
 {
     public const string ApplicationRegistry = "core:application-registry:v1";
+    public const string ApplicationConnectionsPrefix = "core:application-connections:v1:";
+
+    public static string ApplicationConnections(string environment)
+        => $"{ApplicationConnectionsPrefix}{environment.Trim().ToLowerInvariant()}";
 
     public static string ApplicationLaunchTarget(string application, string environment)
         => $"core:application-launch-target:v1:{application.Trim().ToUpperInvariant()}:{environment.Trim().ToLowerInvariant()}";
@@ -15,6 +19,7 @@ public static class AevoCacheKeys
 
     public const string AccessSnapshotPrefix = "core:access-snapshot:v1:";
     public const string HubPrincipalPrefix = "core:hub:principal:v1:";
+    public const string HubBootstrapPrefix = "core:hub:bootstrap:v1:";
 
     public static string AccessSnapshot(
         Guid sessionId,
@@ -27,6 +32,9 @@ public static class AevoCacheKeys
 
     public static string HubPrincipal(Guid userId, Guid? organizationId, Guid? storeId)
         => $"{HubPrincipalPrefix}{userId}:{organizationId?.ToString() ?? "none"}:{storeId?.ToString() ?? "none"}";
+
+    public static string HubBootstrap(string tokenHash)
+        => $"{HubBootstrapPrefix}{tokenHash}";
 
     public static string HubStores(Guid organizationId, bool globalAccess, Guid membershipId)
         => globalAccess
@@ -43,6 +51,9 @@ public static class AevoCacheKeys
 
     public static string HubOrganization(Guid userId, Guid organizationId)
         => $"core:hub:org:v1:{userId}:{organizationId}";
+
+    public static string HubDashboardProjection(Guid organizationId, Guid? storeId)
+        => $"core:hub:dashboard-projection:v1:{organizationId}:{storeId?.ToString() ?? "organization"}";
 }
 
 /// <summary>
@@ -58,6 +69,7 @@ public interface IAevoMemoryCache
         Func<CancellationToken, Task<T>> factory,
         CancellationToken cancellationToken,
         Func<T, bool>? isValid = null);
+    void Put<T>(string key, T value, TimeSpan ttl);
     void Remove(string key);
     void RemoveByPrefix(string prefix);
 }
@@ -104,6 +116,17 @@ public sealed class AevoMemoryCache(IMemoryCache cache) : IAevoMemoryCache
         {
             flights.TryRemove(new KeyValuePair<string, Lazy<Task<object>>>(key, flight));
         }
+    }
+
+    public void Put<T>(string key, T value, TimeSpan ttl)
+    {
+        if (ttl <= TimeSpan.Zero || value is null) return;
+        cache.Set(key, value, new MemoryCacheEntryOptions
+        {
+            AbsoluteExpirationRelativeToNow = ttl,
+            Size = 1
+        });
+        trackedKeys[key] = 0;
     }
 
     public void Remove(string key)

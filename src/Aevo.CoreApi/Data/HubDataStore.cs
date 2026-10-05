@@ -297,6 +297,7 @@ public sealed record HubStoreTemplateRecord(
 public sealed partial class CoreDataStore
 {
     private const int HubStoreDeletionGraceDays = 7;
+    private static readonly JsonSerializerOptions HubDashboardJsonOptions = new() { PropertyNameCaseInsensitive = true };
 
     public Task<HubPrincipalRecord?> ResolveHubPrincipalAsync(CoreSession session, CancellationToken cancellationToken)
     {
@@ -3036,13 +3037,36 @@ public sealed partial class CoreDataStore
 
     public async Task<JsonElement> GetHubOrganizationStatsAsync(Guid organizationId, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenConnectionAsync(cancellationToken);
-        await using var command = new NpgsqlCommand("select jsonb_build_object('organizationId',@organization_id,'totalStores',(select count(*) from public.stores where organization_id=@organization_id and status='ACTIVE'),'totalMembers',(select count(*) from public.memberships where organization_id=@organization_id and status='ACTIVE'),'activeApps',(select count(distinct app_code) from aevo_store_application_bindings where organization_id=@organization_id and status='ACTIVE'),'activeDevices',(select count(*) from public.devices where organization_id=@organization_id and status='ACTIVE'))", connection);
-        command.Parameters.AddWithValue("organization_id", organizationId);
-        return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "{}");
+        return await RequestPerformance.MeasureDatabaseAsync(
+            "hub.organization.stats",
+            async () =>
+            {
+                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await using var command = new NpgsqlCommand("select jsonb_build_object('organizationId',@organization_id,'totalStores',(select count(*) from public.stores where organization_id=@organization_id and status='ACTIVE'),'totalMembers',(select count(*) from public.memberships where organization_id=@organization_id and status='ACTIVE'),'activeApps',(select count(distinct app_code) from aevo_store_application_bindings where organization_id=@organization_id and status='ACTIVE'),'activeDevices',(select count(*) from public.devices where organization_id=@organization_id and status='ACTIVE'))", connection);
+                command.Parameters.AddWithValue("organization_id", organizationId);
+                return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "{}");
+            });
     }
 
-    public async Task<JsonElement> GetHubDashboardProjectionAsync(
+    public Task<JsonElement> GetHubDashboardProjectionAsync(
+        Guid organizationId,
+        Guid? storeId,
+        string environment,
+        CancellationToken cancellationToken)
+    {
+        if (memoryCache is null)
+        {
+            return GetHubDashboardProjectionFromDatabaseAsync(organizationId, storeId, environment, cancellationToken);
+        }
+
+        return memoryCache.GetOrCreateAsync(
+            AevoCacheKeys.HubDashboardProjection(organizationId, storeId),
+            TimeSpan.FromMinutes(5),
+            ct => GetHubDashboardProjectionFromDatabaseAsync(organizationId, storeId, environment, ct),
+            cancellationToken);
+    }
+
+    private async Task<JsonElement> GetHubDashboardProjectionFromDatabaseAsync(
         Guid organizationId,
         Guid? storeId,
         string environment,
@@ -3050,36 +3074,85 @@ public sealed partial class CoreDataStore
     {
         JsonElement? storedProjection = null;
         DateTimeOffset? generatedAt = null;
+        var stats = ParseJson(null, "{}");
+        IReadOnlyList<ApplicationConnectionRecord> connections = Array.Empty<ApplicationConnectionRecord>();
         try
         {
-            await using (var connection = await OpenConnectionAsync(cancellationToken))
-            await using (var command = new NpgsqlCommand(
-                """
-                select projection, generated_at
-                from aevo_hub_dashboard_projections
-                where organization_id = @organization_id
-                  and store_id is not distinct from @store_id
-                """, connection))
-            {
-                command.Parameters.AddWithValue("organization_id", organizationId);
-                AddNullableGuid(command, "store_id", storeId);
-                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-                if (await reader.ReadAsync(cancellationToken))
+            await RequestPerformance.MeasureDatabaseAsync(
+                "hub.dashboard.projection.read",
+                async () =>
                 {
-                    storedProjection = ParseJson(reader.GetString(0), "{}");
-                    generatedAt = reader.GetFieldValue<DateTimeOffset>(1);
-                }
-            }
+                    await using var connection = await OpenConnectionAsync(cancellationToken);
+                    await using var command = new NpgsqlCommand(
+                        """
+                        -- Keep the projection read in the same exchange as the
+                        -- fallback stats and connection summary below.
+                        select projection, generated_at
+                        from aevo_hub_dashboard_projections
+                        where organization_id = @organization_id
+                          and store_id is not distinct from @store_id
+                        ;
+
+                        select case when @store_id is null then
+                          jsonb_build_object(
+                            'organizationId', @organization_id,
+                            'totalStores', (select count(*) from public.stores where organization_id = @organization_id and status = 'ACTIVE'),
+                            'totalMembers', (select count(*) from public.memberships where organization_id = @organization_id and status = 'ACTIVE'),
+                            'activeApps', (select count(distinct app_code) from aevo_store_application_bindings where organization_id = @organization_id and status = 'ACTIVE'),
+                            'activeDevices', (select count(*) from public.devices where organization_id = @organization_id and status = 'ACTIVE')
+                          )
+                        else
+                          jsonb_build_object(
+                            'storeId', @store_id,
+                            'products', (select count(*) from public.product_availability where organization_id = @organization_id and store_id = @store_id),
+                            'devices', (select count(*) from public.devices where organization_id = @organization_id and store_id = @store_id and status = 'ACTIVE')
+                          )
+                        end;
+
+                        select coalesce(jsonb_agg(jsonb_build_object(
+                          'appCode', r.code,
+                          'label', r.name,
+                          'status', coalesce(c.status, 'not_configured'),
+                          'baseUrl', c.base_url,
+                          'checkedAt', c.checked_at,
+                          'latencyMs', c.latency_ms,
+                          'lastErrorCode', c.last_error_code,
+                          'metadata', c.metadata
+                        ) order by r.code), '[]'::jsonb)
+                        from aevo_application_registry r
+                        left join aevo_application_connections c
+                          on c.app_code = r.code and c.environment = @environment
+                        """, connection);
+                    command.Parameters.AddWithValue("organization_id", organizationId);
+                    AddNullableGuid(command, "store_id", storeId);
+                    command.Parameters.AddWithValue("environment", environment);
+                    await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                    if (await reader.ReadAsync(cancellationToken))
+                    {
+                        if (!reader.IsDBNull(0)) storedProjection = ParseJson(reader.GetValue(0), "{}");
+                        if (!reader.IsDBNull(1)) generatedAt = reader.GetFieldValue<DateTimeOffset>(1);
+                    }
+                    if (!await reader.NextResultAsync(cancellationToken) || !await reader.ReadAsync(cancellationToken))
+                    {
+                        throw new CoreDatabaseException("Hub dashboard stats result was unavailable.");
+                    }
+                    stats = ParseJson(reader.GetValue(0), "{}");
+
+                    if (!await reader.NextResultAsync(cancellationToken) || !await reader.ReadAsync(cancellationToken))
+                    {
+                        throw new CoreDatabaseException("Hub dashboard connection result was unavailable.");
+                    }
+                    var connectionPayload = ParseJson(reader.GetValue(0), "[]");
+                    connections = JsonSerializer.Deserialize<ApplicationConnectionRecord[]>(
+                        connectionPayload.GetRawText(),
+                        HubDashboardJsonOptions) ?? [];
+                });
 
             if (storedProjection.HasValue && generatedAt.HasValue && generatedAt.Value >= DateTimeOffset.UtcNow.AddMinutes(-5))
             {
                 return storedProjection.Value;
             }
 
-            var stats = storeId.HasValue
-                ? await GetHubStoreStatsAsync(organizationId, storeId.Value, cancellationToken)
-                : await GetHubOrganizationStatsAsync(organizationId, cancellationToken);
-            var connections = await ListConnectionsAsync(environment, cancellationToken);
             var checkedAt = connections
                 .Where(connection => connection.CheckedAt.HasValue)
                 .Select(connection => connection.CheckedAt!.Value)
@@ -3096,15 +3169,10 @@ public sealed partial class CoreDataStore
                 checkedAt,
                 now,
                 partial ? "APPLICATION_CONNECTION_PARTIAL" : null);
-            await UpsertHubDashboardProjectionAsync(
-                organizationId,
-                storeId,
-                projection,
-                partial ? "partial" : "fresh",
-                checkedAt,
-                now,
-                partial ? "APPLICATION_CONNECTION_PARTIAL" : null,
-                cancellationToken);
+            // Hub reads must not write this projection. Its RLS policy reserves
+            // persistence for the platform/background projection writer; this
+            // request returns the freshly computed read model and the bounded
+            // L1 cache absorbs repeated navigation reads.
             return projection;
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -3127,41 +3195,6 @@ public sealed partial class CoreDataStore
                 DateTimeOffset.UtcNow,
                 "DASHBOARD_PROJECTION_UNAVAILABLE");
         }
-    }
-
-    private async Task UpsertHubDashboardProjectionAsync(
-        Guid organizationId,
-        Guid? storeId,
-        JsonElement projection,
-        string freshnessState,
-        DateTimeOffset sourceUpdatedAt,
-        DateTimeOffset generatedAt,
-        string? errorCode,
-        CancellationToken cancellationToken)
-    {
-        await using var connection = await OpenConnectionAsync(cancellationToken);
-        await using var command = new NpgsqlCommand(
-            """
-            insert into aevo_hub_dashboard_projections
-              (organization_id, store_id, projection_version, projection, freshness_state, source_updated_at, generated_at, last_error_code)
-            values
-              (@organization_id, @store_id, 'hub-dashboard-v1', @projection, @freshness_state, @source_updated_at, @generated_at, @error_code)
-            on conflict (scope_key) do update set
-              projection_version = excluded.projection_version,
-              projection = excluded.projection,
-              freshness_state = excluded.freshness_state,
-              source_updated_at = excluded.source_updated_at,
-              generated_at = excluded.generated_at,
-              last_error_code = excluded.last_error_code
-            """, connection);
-        command.Parameters.AddWithValue("organization_id", organizationId);
-        AddNullableGuid(command, "store_id", storeId);
-        command.Parameters.AddWithValue("projection", NpgsqlDbType.Jsonb, projection.GetRawText());
-        command.Parameters.AddWithValue("freshness_state", freshnessState);
-        command.Parameters.AddWithValue("source_updated_at", sourceUpdatedAt);
-        command.Parameters.AddWithValue("generated_at", generatedAt);
-        AddNullableText(command, "error_code", errorCode);
-        await command.ExecuteNonQueryAsync(cancellationToken);
     }
 
     private static JsonElement BuildHubDashboardProjection(
@@ -3469,11 +3502,16 @@ public sealed partial class CoreDataStore
 
     public async Task<JsonElement> GetHubStoreStatsAsync(Guid organizationId, Guid storeId, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenConnectionAsync(cancellationToken);
-        await using var command = new NpgsqlCommand("select jsonb_build_object('storeId',@store_id,'products',(select count(*) from public.product_availability where organization_id=@organization_id and store_id=@store_id),'devices',(select count(*) from public.devices where organization_id=@organization_id and store_id=@store_id and status='ACTIVE'))", connection);
-        command.Parameters.AddWithValue("organization_id", organizationId);
-        command.Parameters.AddWithValue("store_id", storeId);
-        return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "{}");
+        return await RequestPerformance.MeasureDatabaseAsync(
+            "hub.store.stats",
+            async () =>
+            {
+                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await using var command = new NpgsqlCommand("select jsonb_build_object('storeId',@store_id,'products',(select count(*) from public.product_availability where organization_id=@organization_id and store_id=@store_id),'devices',(select count(*) from public.devices where organization_id=@organization_id and store_id=@store_id and status='ACTIVE'))", connection);
+                command.Parameters.AddWithValue("organization_id", organizationId);
+                command.Parameters.AddWithValue("store_id", storeId);
+                return ParseJson(await command.ExecuteScalarAsync(cancellationToken), "{}");
+            });
     }
 
     public async Task<JsonElement> UpsertHubCustomerProfileAsync(Guid organizationId, Guid storeId, JsonElement body, CancellationToken cancellationToken)
@@ -3840,6 +3878,9 @@ public sealed partial class CoreDataStore
         if (memoryCache is null) return;
         memoryCache.Remove($"core:hub:stores:v1:{organizationId}:all");
         memoryCache.Remove($"core:hub:stores:v1:{organizationId}:{membershipId}");
+        // The consolidated Hub bootstrap contains the authorized store index;
+        // invalidate all such short-lived entries after a store-scope write.
+        memoryCache.RemoveByPrefix(AevoCacheKeys.HubBootstrapPrefix);
     }
 
     public void InvalidateHubTemplateCache(Guid organizationId)

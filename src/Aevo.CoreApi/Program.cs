@@ -28,6 +28,7 @@ builder.Services.AddSingleton<AppSessionReader>();
 builder.Services.AddSingleton<IAevoMemoryCache, AevoMemoryCache>();
 builder.Services.AddSingleton<CoreDataStore>();
 builder.Services.AddSingleton<QueryPlatformService>();
+builder.Services.AddHostedService<CoreDatabaseWarmupService>();
 builder.Services.AddSingleton<FeedConfigService>();
 builder.Services.AddSingleton<FeedCursorSigner>();
 builder.Services.AddSingleton<FeedSessionContextFactory>();
@@ -93,8 +94,10 @@ app.Use(async (context, next) =>
             context.Response.Headers["x-aevo-perf-cache"] = snapshot.CacheStatus;
             context.Response.Headers["x-aevo-perf-db-wall-ms"] = snapshot.DatabaseWallMilliseconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
             context.Response.Headers["x-aevo-perf-db-aggregate-ms"] = snapshot.DatabaseAggregateMilliseconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
+            context.Response.Headers["x-aevo-perf-db-open-ms"] = snapshot.DatabaseConnectionOpenMilliseconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
             context.Response.Headers["x-aevo-perf-total-ms"] = snapshot.TotalMilliseconds.ToString("F2", System.Globalization.CultureInfo.InvariantCulture);
             context.Response.Headers["x-aevo-perf-db-query-count"] = snapshot.DatabaseQueryCount.ToString(System.Globalization.CultureInfo.InvariantCulture);
+            context.Response.Headers["x-aevo-perf-db-ops"] = snapshot.DatabaseOperationBreakdown;
         }
         return Task.CompletedTask;
     });
@@ -128,7 +131,7 @@ app.Use(async (context, next) =>
                 requestId, context.Request.Method, context.Request.Path, context.Response.StatusCode,
                 snapshot.TotalMilliseconds, snapshot.AuthenticationMilliseconds, snapshot.AuthorizationMilliseconds,
                 snapshot.DatabaseWallMilliseconds, snapshot.DatabaseAggregateMilliseconds, snapshot.ExternalApiMilliseconds, snapshot.SerializationMilliseconds,
-                snapshot.CacheLookupMilliseconds, snapshot.DatabaseQueryCount, snapshot.CacheStatus);
+                snapshot.CacheLookupMilliseconds, snapshot.DatabaseQueryCount, snapshot.CacheStatus, snapshot.DatabaseOperationBreakdown);
         }
         else if (snapshot.TotalMilliseconds >= warnThreshold || logAll)
         {
@@ -137,7 +140,7 @@ app.Use(async (context, next) =>
                 requestId, context.Request.Method, context.Request.Path, context.Response.StatusCode,
                 snapshot.TotalMilliseconds, snapshot.AuthenticationMilliseconds, snapshot.AuthorizationMilliseconds,
                 snapshot.DatabaseWallMilliseconds, snapshot.DatabaseAggregateMilliseconds, snapshot.ExternalApiMilliseconds, snapshot.SerializationMilliseconds,
-                snapshot.CacheLookupMilliseconds, snapshot.DatabaseQueryCount, snapshot.CacheStatus, snapshot.TotalMilliseconds >= warnThreshold ? "warn" : "normal");
+                snapshot.CacheLookupMilliseconds, snapshot.DatabaseQueryCount, snapshot.CacheStatus, snapshot.DatabaseOperationBreakdown, snapshot.TotalMilliseconds >= warnThreshold ? "warn" : "normal");
         }
         RequestPerformance.Detach(performance);
     }
@@ -1167,13 +1170,47 @@ app.MapGet("/v1/admin/audit-logs", async (HttpContext context, AppSessionReader 
 app.MapGet("/api/auth/me", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
 {
     var application = RequestedApplication(context, null, "ADMIN");
-    var authentication = await RequireSessionAsync(context, sessions, database, application);
-    if (authentication.Failure is not null) return authentication.Failure;
-    var session = authentication.Session!;
+    var includeHubStores = application == "HUB"
+        && string.Equals(context.Request.Query["includeStores"].ToString(), "true", StringComparison.OrdinalIgnoreCase);
+    CoreSession session;
     HubPrincipalRecord? hubPrincipal = null;
-    using (RequestPerformance.Measure(context, "authorization"))
+    IReadOnlyList<object>? hubStores = null;
+
+    if (includeHubStores)
     {
-        if (application == "HUB") hubPrincipal = await database.ResolveHubPrincipalAsync(session, context.RequestAborted);
+        var bootstrap = await RequireHubBootstrapSessionAsync(context, sessions, database);
+        if (bootstrap.Failure is not null) return bootstrap.Failure;
+        session = bootstrap.Session!;
+        hubPrincipal = bootstrap.Principal;
+        hubStores = bootstrap.Stores
+            .Select(store => (object)new
+            {
+                store.Id,
+                store.OrganizationId,
+                store.Code,
+                store.Name,
+                store.Timezone,
+                store.Currency,
+                store.StoreMode,
+                store.Address,
+                store.Phone,
+                store.TaxId,
+                store.Status
+            })
+            .ToArray();
+    }
+    else
+    {
+        var authentication = await RequireSessionAsync(context, sessions, database, application);
+        if (authentication.Failure is not null) return authentication.Failure;
+        session = authentication.Session!;
+        using (RequestPerformance.Measure(context, "authorization"))
+        {
+            if (application == "HUB")
+            {
+                hubPrincipal = await database.ResolveHubPrincipalAsync(session, context.RequestAborted);
+            }
+        }
     }
     object? access = application == "HUB"
         ? new
@@ -1212,6 +1249,7 @@ app.MapGet("/api/auth/me", async (HttpContext context, AppSessionReader sessions
         session = new { rememberMe = session.RememberMe },
         principal = hubPrincipal,
         access,
+        stores = includeHubStores ? hubStores : null,
         effectiveUser = (object?)null,
         impersonation = (object?)null
     });
@@ -1740,6 +1778,32 @@ app.MapGet("/api/v1/access", async (HttpContext context, AppSessionReader sessio
 {
     var application = context.Request.Query["application"].ToString().Trim().ToUpperInvariant();
     if (!ApplicationCodes.All.Contains(application)) return Error(context, StatusCodes.Status400BadRequest, "INVALID_APPLICATION", "Unknown application code.");
+
+    var organizationQuery = context.Request.Query["organizationId"].ToString().Trim();
+    var storeQuery = context.Request.Query["storeId"].ToString().Trim();
+    if (application == "HUB" && string.IsNullOrWhiteSpace(organizationQuery) && string.IsNullOrWhiteSpace(storeQuery))
+    {
+        var hubAuthentication = await RequireHubBootstrapSessionAsync(context, sessions, database);
+        if (hubAuthentication.Failure is not null) return hubAuthentication.Failure;
+        using var authorizationTiming = RequestPerformance.Measure(context, "authorization");
+        var hubPrincipal = hubAuthentication.Principal;
+        var hubSession = hubAuthentication.Session!;
+        return Results.Ok(new
+        {
+            allowed = hubPrincipal is not null,
+            application,
+            appCode = application,
+            reason = hubPrincipal is not null ? "ALLOWED" : "MEMBERSHIP_REQUIRED",
+            userId = hubSession.UserId,
+            organizationId = hubPrincipal?.OrganizationId ?? hubSession.OrganizationId,
+            storeId = hubSession.StoreId,
+            permissions = hubPrincipal?.Permissions ?? Array.Empty<string>(),
+            platformRole = (string?)null,
+            platformPermissions = Array.Empty<string>(),
+            checkedAt = DateTimeOffset.UtcNow
+        });
+    }
+
     var authentication = await RequireSessionAsync(context, sessions, database, application);
     var hubProxy = false;
     if (authentication.Failure is not null
@@ -1756,8 +1820,6 @@ app.MapGet("/api/v1/access", async (HttpContext context, AppSessionReader sessio
     var session = authentication.Session!;
     Guid? requestedOrganizationId = null;
     Guid? requestedStoreId = null;
-    var organizationQuery = context.Request.Query["organizationId"].ToString().Trim();
-    var storeQuery = context.Request.Query["storeId"].ToString().Trim();
     if (!string.IsNullOrWhiteSpace(organizationQuery) && !Guid.TryParse(organizationQuery, out var parsedOrganizationId))
     {
         return Error(context, StatusCodes.Status400BadRequest, "TENANT_CONTEXT_INVALID", "The organizationId query parameter must be a UUID.");
@@ -4007,6 +4069,69 @@ static string RequestedApplication(HttpContext context, string? bodyApplication,
     return string.IsNullOrWhiteSpace(requested) ? fallback : requested.ToUpperInvariant();
 }
 
+static async Task<(CoreSession? Session, HubPrincipalRecord? Principal, IReadOnlyList<HubStoreRecord> Stores, IResult? Failure)> RequireHubBootstrapSessionAsync(
+    HttpContext context,
+    AppSessionReader sessions,
+    CoreDataStore database)
+{
+    var token = sessions.ReadSessionCookie(context, "HUB");
+    if (token is null) return (null, null, Array.Empty<HubStoreRecord>(), Error(context, StatusCodes.Status401Unauthorized, "AUTHENTICATION_REQUIRED", "An app-scoped Hub session is required."));
+    if (!database.IsConfigured) return (null, null, Array.Empty<HubStoreRecord>(), Error(context, StatusCodes.Status503ServiceUnavailable, "CORE_API_NOT_CONFIGURED", "The Core API session store is not configured."));
+
+    try
+    {
+        using var authentication = RequestPerformance.Measure(context, "authentication");
+        var bootstrap = await database.ResolveHubSessionBootstrapAsync(token, context.RequestAborted);
+        if (bootstrap is null)
+        {
+            return (null, null, Array.Empty<HubStoreRecord>(), Error(context, StatusCodes.Status401Unauthorized, "AUTHENTICATION_REQUIRED", "The Hub session is invalid or expired."));
+        }
+
+        var session = bootstrap.Session;
+        var tenantContext = TenantContextValidator.ValidateHeaders(
+            session.OrganizationId,
+            session.StoreId,
+            context.Request.Headers["x-tenant-id"].ToString(),
+            context.Request.Headers["x-organization-id"].ToString(),
+            context.Request.Headers["x-store-id"].ToString());
+        if (!tenantContext.IsValid)
+        {
+            return (null, null, Array.Empty<HubStoreRecord>(), Error(context, tenantContext.StatusCode, tenantContext.Code!, tenantContext.Message!));
+        }
+
+        var configuration = context.RequestServices.GetRequiredService<IConfiguration>();
+        var touchInterval = SessionTouchInterval(configuration);
+        if (session.LastSeenAt is null || DateTimeOffset.UtcNow >= session.LastSeenAt.Value.AddSeconds(touchInterval))
+        {
+            var idleExpiresAt = await database.TouchSessionIfDueAsync(
+                session.Id,
+                SessionIdleLifetime(configuration, session.RememberMe),
+                touchInterval,
+                context.RequestAborted);
+            if (idleExpiresAt is null)
+            {
+                return (null, null, Array.Empty<HubStoreRecord>(), Error(context, StatusCodes.Status401Unauthorized, "AUTHENTICATION_REQUIRED", "The app-scoped session is no longer active."));
+            }
+            database.InvalidateSessionSnapshot("HUB", token);
+            session = session with { ExpiresAt = idleExpiresAt.Value, LastSeenAt = DateTimeOffset.UtcNow };
+        }
+
+        if (context.Request.Cookies.TryGetValue(sessions.CsrfCookieName(session.AppCode), out var csrfToken) && !string.IsNullOrWhiteSpace(csrfToken))
+        {
+            var secure = IsSecureCookie(configuration);
+            var cookieExpiresAt = ((session.RememberMe ? session.AbsoluteExpiresAt : null) ?? session.ExpiresAt).ToString("O");
+            context.Response.Headers.Append("set-cookie", SessionCookie(sessions.CookieName(session.AppCode), token, cookieExpiresAt, secure, session.RememberMe));
+            context.Response.Headers.Append("set-cookie", CsrfCookie(sessions.CsrfCookieName(session.AppCode), csrfToken, cookieExpiresAt, secure, session.RememberMe));
+        }
+
+        return (session, bootstrap.Principal, bootstrap.Stores, null);
+    }
+    catch (CoreDatabaseException error)
+    {
+        return (null, null, Array.Empty<HubStoreRecord>(), DatabaseError(context, error));
+    }
+}
+
 static async Task<(CoreSession? Session, IResult? Failure)> RequireSessionAsync(
     HttpContext context,
     AppSessionReader sessions,
@@ -4319,11 +4444,12 @@ internal static class CoreApiLog
         double SerializationMs,
         double CacheLookupMs,
         int DbQueryCount,
-        string CacheStatus)
+        string CacheStatus,
+        string DatabaseOperations)
     {
         logger.LogError(
-            "api.performance request_id={RequestId} method={Method} path={Path} status={StatusCode} total_ms={TotalMs} auth_ms={AuthMs} authz_ms={AuthzMs} db_wall_ms={DbWallMs} db_aggregate_ms={DbAggregateMs} external_api_ms={ExternalApiMs} serialization_ms={SerializationMs} cache_lookup_ms={CacheLookupMs} db_query_count={DbQueryCount} cache_status={CacheStatus} threshold=critical",
-            RequestId, Method, Path, StatusCode, TotalMs, AuthMs, AuthzMs, DbWallMs, DbAggregateMs, ExternalApiMs, SerializationMs, CacheLookupMs, DbQueryCount, CacheStatus);
+            "api.performance request_id={RequestId} method={Method} path={Path} status={StatusCode} total_ms={TotalMs} auth_ms={AuthMs} authz_ms={AuthzMs} db_wall_ms={DbWallMs} db_aggregate_ms={DbAggregateMs} external_api_ms={ExternalApiMs} serialization_ms={SerializationMs} cache_lookup_ms={CacheLookupMs} db_query_count={DbQueryCount} cache_status={CacheStatus} db_ops={DatabaseOperations} threshold=critical",
+            RequestId, Method, Path, StatusCode, TotalMs, AuthMs, AuthzMs, DbWallMs, DbAggregateMs, ExternalApiMs, SerializationMs, CacheLookupMs, DbQueryCount, CacheStatus, DatabaseOperations);
     }
 
     public static void PerformanceWarning(
@@ -4342,11 +4468,12 @@ internal static class CoreApiLog
         double CacheLookupMs,
         int DbQueryCount,
         string CacheStatus,
+        string DatabaseOperations,
         string Threshold)
     {
         logger.LogWarning(
-            "api.performance request_id={RequestId} method={Method} path={Path} status={StatusCode} total_ms={TotalMs} auth_ms={AuthMs} authz_ms={AuthzMs} db_wall_ms={DbWallMs} db_aggregate_ms={DbAggregateMs} external_api_ms={ExternalApiMs} serialization_ms={SerializationMs} cache_lookup_ms={CacheLookupMs} db_query_count={DbQueryCount} cache_status={CacheStatus} threshold={Threshold}",
-            RequestId, Method, Path, StatusCode, TotalMs, AuthMs, AuthzMs, DbWallMs, DbAggregateMs, ExternalApiMs, SerializationMs, CacheLookupMs, DbQueryCount, CacheStatus, Threshold);
+            "api.performance request_id={RequestId} method={Method} path={Path} status={StatusCode} total_ms={TotalMs} auth_ms={AuthMs} authz_ms={AuthzMs} db_wall_ms={DbWallMs} db_aggregate_ms={DbAggregateMs} external_api_ms={ExternalApiMs} serialization_ms={SerializationMs} cache_lookup_ms={CacheLookupMs} db_query_count={DbQueryCount} cache_status={CacheStatus} db_ops={DatabaseOperations} threshold={Threshold}",
+            RequestId, Method, Path, StatusCode, TotalMs, AuthMs, AuthzMs, DbWallMs, DbAggregateMs, ExternalApiMs, SerializationMs, CacheLookupMs, DbQueryCount, CacheStatus, DatabaseOperations, Threshold);
     }
 }
 #pragma warning restore CA1848
