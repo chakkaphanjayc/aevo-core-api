@@ -6,7 +6,7 @@ using Aevo.CoreApi.Security;
 
 namespace Aevo.CoreApi;
 
-public static class HubApiEndpoints
+public static partial class HubApiEndpoints
 {
     private sealed record LaunchReadinessResult(
         bool Ready,
@@ -35,6 +35,8 @@ public static class HubApiEndpoints
 
     public static void MapHubApi(this WebApplication app)
     {
+        app.MapHubQueryApi();
+
         app.MapGet("/api/v1/hub/me", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
         {
             var auth = await AuthenticateAsync(context, sessions, database, false);
@@ -708,9 +710,41 @@ public static class HubApiEndpoints
         app.MapPost("/api/v1/hub/members", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
         {
             var auth = await AuthenticateAsync(context, sessions, database, true, true, "member.manage");
-            if (auth.Failure is not null) return auth.Failure;
-            var member = await database.CreateHubMemberAsync(auth.Principal!, await ReadBodyAsync(context), context.RequestAborted);
-            return Results.Ok(new { success = true, member });
+            if (auth.Failure is not null)
+            {
+                if (auth.Principal is not null)
+                {
+                    var reasonCode = auth.Principal.Permissions.Contains("member.manage", StringComparer.Ordinal)
+                        ? "CSRF_INVALID"
+                        : "PERMISSION_REQUIRED";
+                    await database.RecordHubMemberAssignmentAttemptAsync(
+                        auth.Principal,
+                        null,
+                        "MULTIPLE",
+                        reasonCode,
+                        RequestId(context),
+                        context.RequestAborted);
+                }
+                return auth.Failure;
+            }
+
+            var body = await ReadBodyAsync(context);
+            try
+            {
+                var member = await database.CreateHubMemberAsync(auth.Principal!, body, RequestId(context), context.RequestAborted);
+                return Results.Ok(new { success = true, member });
+            }
+            catch (HubMemberAssignmentException error)
+            {
+                await database.RecordHubMemberAssignmentAttemptAsync(
+                    auth.Principal!,
+                    null,
+                    "MULTIPLE",
+                    error.Code,
+                    RequestId(context),
+                    context.RequestAborted);
+                return Fail(context, error.StatusCode, error.Code, error.Message);
+            }
         });
         app.MapGet("/api/v1/hub/members/{membershipId:guid}/applications", async (HttpContext context, Guid membershipId, AppSessionReader sessions, CoreDataStore database) =>
         {
@@ -721,9 +755,58 @@ public static class HubApiEndpoints
         app.MapPatch("/api/v1/hub/members/{membershipId:guid}/applications/{applicationCode}", async (HttpContext context, Guid membershipId, string applicationCode, AppSessionReader sessions, CoreDataStore database) =>
         {
             var auth = await AuthenticateAsync(context, sessions, database, true, true, "member.manage");
-            if (auth.Failure is not null) return auth.Failure;
-            var assignment = await database.UpdateHubMemberAssignmentAsync(auth.Principal!, membershipId, applicationCode, await ReadBodyAsync(context), context.RequestAborted);
-            return assignment is null ? Fail(context, 404, "MEMBER_ASSIGNMENT_NOT_FOUND", "Member application assignment not found.") : Results.Ok(new { success = true, assignment });
+            if (auth.Failure is not null)
+            {
+                if (auth.Principal is not null)
+                {
+                    var reasonCode = auth.Principal.Permissions.Contains("member.manage", StringComparer.Ordinal)
+                        ? "CSRF_INVALID"
+                        : "PERMISSION_REQUIRED";
+                    await database.RecordHubMemberAssignmentAttemptAsync(
+                        auth.Principal,
+                        membershipId,
+                        applicationCode,
+                        reasonCode,
+                        RequestId(context),
+                        context.RequestAborted);
+                }
+                return auth.Failure;
+            }
+
+            try
+            {
+                var assignment = await database.UpdateHubMemberAssignmentAsync(
+                    auth.Principal!,
+                    membershipId,
+                    applicationCode,
+                    await ReadBodyAsync(context),
+                    RequestId(context),
+                    context.RequestAborted);
+                if (assignment is null)
+                {
+                    await database.RecordHubMemberAssignmentAttemptAsync(
+                        auth.Principal!,
+                        membershipId,
+                        applicationCode,
+                        "MEMBER_ASSIGNMENT_NOT_FOUND",
+                        RequestId(context),
+                        context.RequestAborted);
+                    return Fail(context, 404, "MEMBER_ASSIGNMENT_NOT_FOUND", "Member application assignment not found.");
+                }
+
+                return Results.Ok(new { success = true, assignment });
+            }
+            catch (HubMemberAssignmentException error)
+            {
+                await database.RecordHubMemberAssignmentAttemptAsync(
+                    auth.Principal!,
+                    membershipId,
+                    applicationCode,
+                    error.Code,
+                    RequestId(context),
+                    context.RequestAborted);
+                return Fail(context, error.StatusCode, error.Code, error.Message);
+            }
         });
         app.MapPatch("/api/v1/hub/members/{membershipId:guid}", async (HttpContext context, Guid membershipId, AppSessionReader sessions, CoreDataStore database) =>
         {
@@ -967,17 +1050,43 @@ public static class HubApiEndpoints
             {
                 foreach (var applicationCode in applicationCodes)
                 {
-                    await database.UpdateHubMemberAssignmentAsync(principal, principal.MembershipId, applicationCode, JsonDocument.Parse("{\"status\":\"ACTIVE\"}").RootElement, context.RequestAborted);
-                    if (current.StoreId is not null && applicationCode is "PLAY" or "POS" or "KIOSK" or "QUEUE")
+                    if (!HubMemberAssignmentPolicy.IsWorkforceApplicationCode(applicationCode)) continue;
+                    var assignmentBody = JsonSerializer.SerializeToElement(new
                     {
-                        await database.UpdateHubStoreApplicationAsync(
+                        status = "ACTIVE",
+                        storeIds = current.StoreId is { } assignmentStoreId ? new[] { assignmentStoreId } : []
+                    });
+                    try
+                    {
+                        await database.UpdateHubMemberAssignmentAsync(
                             principal,
-                            current.StoreId.Value,
+                            principal.MembershipId,
                             applicationCode,
-                            true,
+                            assignmentBody,
                             RequestId(context),
-                            $"onboarding-store-binding-{current.Id:N}-{applicationCode}",
                             context.RequestAborted);
+                        if (current.StoreId is not null)
+                        {
+                            await database.UpdateHubStoreApplicationAsync(
+                                principal,
+                                current.StoreId.Value,
+                                applicationCode,
+                                true,
+                                RequestId(context),
+                                $"onboarding-store-binding-{current.Id:N}-{applicationCode}",
+                                context.RequestAborted);
+                        }
+                    }
+                    catch (HubMemberAssignmentException error)
+                    {
+                        await database.RecordHubMemberAssignmentAttemptAsync(
+                            principal,
+                            principal.MembershipId,
+                            applicationCode,
+                            error.Code,
+                            RequestId(context),
+                            context.RequestAborted);
+                        return Fail(context, error.StatusCode, error.Code, error.Message);
                     }
                 }
             }

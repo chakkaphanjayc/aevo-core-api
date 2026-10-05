@@ -12,6 +12,12 @@ public static class HubApiContract
 
     public static readonly IReadOnlyList<string> Routes = new[]
     {
+        "/api/v1/query/models",
+        "/api/v1/query/models/:technicalName",
+        "/api/v1/query/execute",
+        "/api/v1/query/exports",
+        "/api/v1/query/exports/:jobId",
+        "/api/v1/query/imports",
         "/api/v1/hub/contract",
         "/api/v1/hub/me",
         "/api/v1/hub/bootstrap",
