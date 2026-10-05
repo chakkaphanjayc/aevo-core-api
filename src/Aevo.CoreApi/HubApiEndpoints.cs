@@ -6,7 +6,7 @@ using Aevo.CoreApi.Security;
 
 namespace Aevo.CoreApi;
 
-public static class HubApiEndpoints
+public static partial class HubApiEndpoints
 {
     private sealed record LaunchReadinessResult(
         bool Ready,
@@ -35,6 +35,8 @@ public static class HubApiEndpoints
 
     public static void MapHubApi(this WebApplication app)
     {
+        app.MapHubQueryApi();
+
         app.MapGet("/api/v1/hub/me", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
         {
             var auth = await AuthenticateAsync(context, sessions, database, false);
