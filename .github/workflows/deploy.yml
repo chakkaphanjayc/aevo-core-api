@@ -1,0 +1,75 @@
+name: Deploy Core API to Cloud Run
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Deployment target environment
+        required: true
+        default: staging
+        type: choice
+        options: [staging, production]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aevo-core-api-${{ github.event.inputs.environment || 'staging' }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+      - run: dotnet restore src/Aevo.CoreApi/Aevo.CoreApi.csproj
+      - run: dotnet restore src/Aevo.CoreApi.Migrator/Aevo.CoreApi.Migrator.csproj
+      - run: dotnet restore tests/Aevo.CoreApi.Tests/Aevo.CoreApi.Tests.csproj
+      - run: dotnet build src/Aevo.CoreApi/Aevo.CoreApi.csproj --configuration Release --no-restore
+      - run: dotnet build src/Aevo.CoreApi.Migrator/Aevo.CoreApi.Migrator.csproj --configuration Release --no-restore
+      - run: dotnet test tests/Aevo.CoreApi.Tests/Aevo.CoreApi.Tests.csproj --configuration Release --no-restore
+
+  deploy:
+    needs: verify
+    if: ${{ (github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main') && secrets.GCP_WORKLOAD_IDENTITY_PROVIDER != '' && secrets.GCP_SERVICE_ACCOUNT != '' }}
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment || 'staging' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker authentication for Artifact Registry
+        run: |
+          gcloud auth configure-docker ${{ vars.GCP_REGION || 'asia-southeast1' }}-docker.pkg.dev --quiet
+
+      - name: Build and Push Core API Container
+        env:
+          REGION: ${{ vars.GCP_REGION || 'asia-southeast1' }}
+          PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+        run: |
+          IMAGE_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/aevo/aevo-core-api:${{ github.sha }}"
+          LATEST_TAG="$REGION-docker.pkg.dev/$PROJECT_ID/aevo/aevo-core-api:latest"
+          docker build -t "$IMAGE_TAG" -t "$LATEST_TAG" .
+          docker push "$IMAGE_TAG"
+          docker push "$LATEST_TAG"
+
+      - name: Deploy to Cloud Run Service
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: aevo-core-api-${{ github.event.inputs.environment || 'staging' }}
+          image: ${{ vars.GCP_REGION || 'asia-southeast1' }}-docker.pkg.dev/${{ vars.GCP_PROJECT_ID }}/aevo/aevo-core-api:${{ github.sha }}
+          region: ${{ vars.GCP_REGION || 'asia-southeast1' }}

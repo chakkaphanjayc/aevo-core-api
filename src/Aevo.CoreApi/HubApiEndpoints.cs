@@ -123,9 +123,30 @@ public static class HubApiEndpoints
 
         app.MapGet("/api/v1/hub/stores", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
         {
-            var auth = await AuthenticateAsync(context, sessions, database, true);
-            if (auth.Failure is not null) return auth.Failure;
-            return Results.Ok(new { stores = await database.ListHubStoresAsync(auth.Principal!, context.RequestAborted) });
+            var token = sessions.ReadSessionCookie(context, "HUB");
+            if (token is null) return Fail(context, 401, "AUTHENTICATION_REQUIRED", "An app-scoped Hub session is required.");
+            if (!database.IsConfigured) return Fail(context, 503, "CORE_API_NOT_CONFIGURED", "The Core API session store is not configured.");
+            try
+            {
+                // This compatibility route is also used by older Hub shells.
+                // Resolve the same session, principal, and store index in one
+                // Core read rather than repeating three authorization queries.
+                var bootstrap = await database.ResolveHubSessionBootstrapAsync(token, context.RequestAborted);
+                if (bootstrap is null) return Fail(context, 401, "AUTHENTICATION_REQUIRED", "The Hub session is invalid or expired.");
+                var tenantContext = TenantContextValidator.ValidateHeaders(
+                    bootstrap.Session.OrganizationId,
+                    bootstrap.Session.StoreId,
+                    context.Request.Headers["x-tenant-id"].ToString(),
+                    context.Request.Headers["x-organization-id"].ToString(),
+                    context.Request.Headers["x-store-id"].ToString());
+                if (!tenantContext.IsValid) return Fail(context, tenantContext.StatusCode, tenantContext.Code!, tenantContext.Message!);
+                if (bootstrap.Principal is null) return Fail(context, 403, "MEMBERSHIP_REQUIRED", "An active Hub organization membership is required.");
+                return Results.Ok(new { stores = bootstrap.Stores });
+            }
+            catch (CoreDatabaseException error)
+            {
+                return Fail(context, 503, "CORE_API_DATABASE_UNAVAILABLE", error.Message);
+            }
         });
         app.MapGet("/api/v1/hub/stores/customer-profiles", async (HttpContext context, AppSessionReader sessions, CoreDataStore database) =>
         {
@@ -1360,8 +1381,9 @@ public static class HubApiEndpoints
         if (!database.IsConfigured) return (null, null, Fail(context, 503, "CORE_API_NOT_CONFIGURED", "The Core API session store is not configured."));
         try
         {
-            var session = await database.ResolveSessionAsync(token, "HUB", context.RequestAborted);
-            if (session is null) return (null, null, Fail(context, 401, "AUTHENTICATION_REQUIRED", "The Hub session is invalid or expired."));
+            var bootstrap = await database.ResolveHubSessionBootstrapAsync(token, context.RequestAborted);
+            if (bootstrap is null) return (null, null, Fail(context, 401, "AUTHENTICATION_REQUIRED", "The Hub session is invalid or expired."));
+            var session = bootstrap.Session;
             var tenantContext = TenantContextValidator.ValidateHeaders(
                 session.OrganizationId,
                 session.StoreId,
@@ -1369,7 +1391,7 @@ public static class HubApiEndpoints
                 context.Request.Headers["x-organization-id"].ToString(),
                 context.Request.Headers["x-store-id"].ToString());
             if (!tenantContext.IsValid) return (null, null, Fail(context, tenantContext.StatusCode, tenantContext.Code!, tenantContext.Message!));
-            var principal = await database.ResolveHubPrincipalAsync(session, context.RequestAborted);
+            var principal = bootstrap.Principal;
             if (requirePrincipal && principal is null) return (session, null, Fail(context, 403, "MEMBERSHIP_REQUIRED", "An active Hub organization membership is required."));
             if (permission is not null && principal is not null && !principal.Permissions.Contains(permission, StringComparer.Ordinal)) return (session, principal, Fail(context, 403, "PERMISSION_REQUIRED", "The current Hub role cannot perform this operation."));
             if (mutation && !CoreDataStore.VerifyCsrf(session, context.Request.Headers["x-csrf-token"].ToString())) return (session, principal, Fail(context, 403, "CSRF_INVALID", "A valid CSRF token is required for this operation."));

@@ -162,6 +162,8 @@ public sealed class PerformanceCacheTests
         Assert.Equal($"core:hub:templates:v1:{orgId}", AevoCacheKeys.HubTemplates(orgId));
         Assert.Equal($"core:hub:profiles:v1:{orgId}:all", AevoCacheKeys.HubProfiles(orgId, true, membershipId));
         Assert.Equal($"core:hub:org:v1:{userId}:{orgId}", AevoCacheKeys.HubOrganization(userId, orgId));
+        Assert.Equal($"core:hub:dashboard-projection:v1:{orgId}:organization", AevoCacheKeys.HubDashboardProjection(orgId, null));
+        Assert.Equal($"core:hub:dashboard-projection:v1:{orgId}:{storeId}", AevoCacheKeys.HubDashboardProjection(orgId, storeId));
     }
 
     [Fact]

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
@@ -27,6 +28,11 @@ public sealed record CoreSession(
     DateTimeOffset? AbsoluteExpiresAt = null);
 
 public sealed record SessionSnapshot(CoreSession Session, DateTimeOffset CachedAt);
+
+public sealed record HubSessionBootstrapRecord(
+    CoreSession Session,
+    HubPrincipalRecord? Principal,
+    IReadOnlyList<HubStoreRecord> Stores);
 
 public sealed record IssuedCoreSession(
     Guid SessionId,
@@ -185,9 +191,11 @@ public sealed partial class CoreDataStore : IAsyncDisposable
     private readonly string? configurationError;
     private readonly byte[]? recoveryEncryptionKey;
     private readonly IAevoMemoryCache? memoryCache;
+    private readonly string environment; // runtime environment used by Hub read-model warmup
     private readonly AevoSingleFlight<CoreSession?> sessionResolutionFlights = new();
     private readonly AevoSingleFlight<CoreApplicationAuthorization?> applicationAuthorizationFlights = new();
     private readonly AevoSingleFlight<HubPrincipalRecord?> hubPrincipalFlights = new();
+    private readonly AevoSingleFlight<HubSessionBootstrapRecord?> hubBootstrapFlights = new();
     private readonly AevoSingleFlight<AccessSnapshot> accessSnapshotFlights = new();
     private readonly TimeSpan sessionSnapshotTtl;
     private readonly TimeSpan accessSnapshotTtl;
@@ -195,8 +203,11 @@ public sealed partial class CoreDataStore : IAsyncDisposable
     public CoreDataStore(IConfiguration configuration, ILogger<CoreDataStore> logger, IAevoMemoryCache? memoryCache = null)
     {
         this.memoryCache = memoryCache;
-        sessionSnapshotTtl = ReadSnapshotTtl(configuration["AEVO_SESSION_SNAPSHOT_TTL_SECONDS"], 3);
-        accessSnapshotTtl = ReadSnapshotTtl(configuration["AEVO_ACCESS_SNAPSHOT_TTL_SECONDS"], 3);
+        environment = configuration["AEVO_ENVIRONMENT"]?.Trim() is { Length: > 0 } configuredEnvironment
+            ? configuredEnvironment
+            : "development";
+        sessionSnapshotTtl = ReadSnapshotTtl(configuration["AEVO_SESSION_SNAPSHOT_TTL_SECONDS"], 60);
+        accessSnapshotTtl = ReadSnapshotTtl(configuration["AEVO_ACCESS_SNAPSHOT_TTL_SECONDS"], 60);
         var recoverySecret = configuration["AEVO_RECOVERY_GRANT_ENCRYPTION_KEY"]?.Trim()
             ?? configuration["AEVO_SESSION_SECRET"]?.Trim();
         if (!string.IsNullOrWhiteSpace(recoverySecret))
@@ -209,7 +220,14 @@ public sealed partial class CoreDataStore : IAsyncDisposable
 
         try
         {
-            dataSource = NpgsqlDataSource.Create(NormalizeDatabaseConnectionString(rawConnectionString));
+            var connectionString = new NpgsqlConnectionStringBuilder(NormalizeDatabaseConnectionString(rawConnectionString));
+            connectionString.MinPoolSize = ReadBoundedInt(configuration["AEVO_DATABASE_POOL_MIN_SIZE"], 4, 0, 32);
+            connectionString.MaxPoolSize = ReadBoundedInt(configuration["AEVO_DATABASE_POOL_MAX_SIZE"], 100, 1, 256);
+            if (connectionString.MaxPoolSize < connectionString.MinPoolSize)
+            {
+                connectionString.MaxPoolSize = connectionString.MinPoolSize;
+            }
+            dataSource = NpgsqlDataSource.Create(connectionString.ConnectionString);
         }
         catch (Exception)
         {
@@ -236,6 +254,14 @@ public sealed partial class CoreDataStore : IAsyncDisposable
     {
         if (memoryCache is null) return;
         memoryCache.Remove(AevoCacheKeys.ApplicationRegistry);
+        if (!string.IsNullOrWhiteSpace(environment))
+        {
+            memoryCache.Remove(AevoCacheKeys.ApplicationConnections(environment));
+        }
+        else
+        {
+            memoryCache.RemoveByPrefix(AevoCacheKeys.ApplicationConnectionsPrefix);
+        }
         if (!string.IsNullOrWhiteSpace(application) && !string.IsNullOrWhiteSpace(environment))
         {
             memoryCache.Remove(AevoCacheKeys.ApplicationLaunchTarget(application, environment));
@@ -271,6 +297,7 @@ public sealed partial class CoreDataStore : IAsyncDisposable
                     memoryCache.Remove(AevoCacheKeys.Session(code, tokenHash));
                 }
             }
+            memoryCache.Remove(AevoCacheKeys.HubBootstrap(tokenHash));
         }
 
         InvalidateAuthorizationCaches();
@@ -287,6 +314,7 @@ public sealed partial class CoreDataStore : IAsyncDisposable
     {
         memoryCache?.RemoveByPrefix(AevoCacheKeys.AccessSnapshotPrefix);
         memoryCache?.RemoveByPrefix(AevoCacheKeys.HubPrincipalPrefix);
+        memoryCache?.RemoveByPrefix(AevoCacheKeys.HubBootstrapPrefix);
     }
 
     public async Task<bool> CanConnectAsync(CancellationToken cancellationToken)
@@ -305,6 +333,15 @@ public sealed partial class CoreDataStore : IAsyncDisposable
         }
     }
 
+    public async Task WarmConnectionPoolAsync(int connectionCount, CancellationToken cancellationToken)
+    {
+        var boundedCount = Math.Clamp(connectionCount, 1, 16);
+        var warmups = Enumerable.Range(0, boundedCount)
+            .Select(_ => CanConnectAsync(cancellationToken))
+            .ToArray();
+        await Task.WhenAll(warmups);
+    }
+
     public Task<CoreSession?> ResolveSessionAsync(string sessionToken, string? appCode, CancellationToken cancellationToken)
     {
         // Session state is mutable security state: logout, password changes,
@@ -320,6 +357,328 @@ public sealed partial class CoreDataStore : IAsyncDisposable
         }
 
         return ResolveSessionSnapshotAsync(key, tokenHash, sessionToken, appCode, cancellationToken);
+    }
+
+    /// <summary>
+    /// Resolves the Hub session, principal, and authorized store index in one
+    /// database statement. The read model is short-lived and invalidated with
+    /// the ordinary session/authorization caches; it is not a permission
+    /// authority and never crosses the opaque session-token boundary.
+    /// </summary>
+    public Task<HubSessionBootstrapRecord?> ResolveHubSessionBootstrapAsync(
+        string sessionToken,
+        CancellationToken cancellationToken)
+    {
+        var tokenHash = SessionHash(sessionToken);
+        var key = tokenHash;
+        return hubBootstrapFlights.RunAsync(key, () =>
+        {
+            if (memoryCache is null)
+            {
+                return RequestPerformance.MeasureDatabaseAsync(
+                    "hub.bootstrap",
+                    () => ResolveHubSessionBootstrapFromDatabaseAsync(sessionToken, cancellationToken));
+            }
+
+            return memoryCache.GetOrCreateAsync(
+                AevoCacheKeys.HubBootstrap(tokenHash),
+                sessionSnapshotTtl,
+                ct => RequestPerformance.MeasureDatabaseAsync(
+                    "hub.bootstrap",
+                    () => ResolveHubSessionBootstrapFromDatabaseAsync(sessionToken, ct)),
+                cancellationToken,
+                IsHubSessionBootstrapUsable);
+        });
+    }
+
+    private static bool IsHubSessionBootstrapUsable(HubSessionBootstrapRecord? bootstrap)
+    {
+        if (bootstrap is null) return false;
+        var now = DateTimeOffset.UtcNow;
+        return bootstrap.Session.ExpiresAt > now
+            && (bootstrap.Session.AbsoluteExpiresAt is null || bootstrap.Session.AbsoluteExpiresAt > now);
+    }
+
+    private async Task<HubSessionBootstrapRecord?> ResolveHubSessionBootstrapFromDatabaseAsync(
+        string sessionToken,
+        CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenConnectionAsync(cancellationToken);
+        await using var command = new NpgsqlCommand(
+            """
+            with session_row as materialized (
+              select s.id, s.user_id, s.app_code, s.expires_at, s.organization_id, s.store_id,
+                     u.email, u.display_name, r.role_code, s.csrf_token_hash, s.remember_me, s.last_seen_at,
+                     s.absolute_expires_at
+              from aevo_app_sessions s
+              join aevo_identity_users u on u.id = s.user_id and u.status = 'active'
+              left join aevo_platform_roles r on r.user_id = s.user_id and r.status = 'active'
+              where s.session_hash = @session_hash
+                and s.app_code = 'HUB'
+                and s.revoked_at is null
+                and s.expires_at > now()
+                and s.idle_expires_at > now()
+                and s.absolute_expires_at > now()
+              limit 1
+            ), context as materialized (
+              select
+                set_config('aevo.user_id', session_row.user_id::text, true),
+                set_config('aevo.organization_id', coalesce(session_row.organization_id::text, ''), true),
+                set_config('aevo.store_id', coalesce(session_row.store_id::text, ''), true),
+                set_config('aevo.app_code', 'HUB', true),
+                set_config('aevo.platform_role', coalesce(session_row.role_code, ''), true)
+              from session_row
+            ), principal_row as materialized (
+              select m.id as membership_id, m.organization_id, o.name as organization_name, o.slug as organization_slug,
+                     r.code as role, coalesce(array_agg(distinct rp.permission_code)
+                       filter (where rp.permission_code is not null), '{}') as permissions
+              from session_row session
+              cross join context
+              join public.memberships m on m.user_id = session.user_id
+                and m.status = 'ACTIVE'
+                and (session.organization_id is null or m.organization_id = session.organization_id)
+              join public.organizations o on o.id = m.organization_id and o.status = 'ACTIVE'
+              join public.roles r on r.id = m.role_id
+              left join public.role_permissions rp on rp.role_id = r.id
+              where exists (
+                select 1
+                from aevo_application_assignments aa
+                where aa.user_id = m.user_id
+                  and (aa.organization_id is null or aa.organization_id = m.organization_id)
+                  and aa.app_code = 'HUB'
+                  and aa.status = 'active'
+                  and aa.starts_at <= now()
+                  and (aa.expires_at is null or aa.expires_at > now())
+              )
+              group by m.id, m.organization_id, o.name, o.slug, r.code, m.created_at
+              order by m.created_at
+              limit 1
+            ), store_rows as materialized (
+              select s.id, s.organization_id, s.code, s.name, s.timezone, s.currency, s.status,
+                     s.store_mode, s.address, s.phone, s.tax_id, s.created_at, s.updated_at
+              from public.stores s
+              cross join principal_row principal
+              where s.organization_id = principal.organization_id
+                and (
+                  s.status = 'ACTIVE'
+                  or exists (
+                    select 1
+                    from aevo_data_deletion_requests deletion
+                    where deletion.organization_id = s.organization_id
+                      and deletion.resource_type = 'STORE'
+                      and deletion.resource_id = s.id
+                      and deletion.status = 'PENDING'
+                  )
+                )
+                and (
+                  principal.role in ('OWNER', 'ADMIN')
+                  or exists (
+                    select 1
+                    from public.membership_stores ms
+                    where ms.membership_id = principal.membership_id
+                      and ms.store_id = s.id
+                  )
+                )
+            )
+            select jsonb_build_object(
+              'session', coalesce((
+                select jsonb_build_object(
+                  'id', id,
+                  'userId', user_id,
+                  'appCode', app_code,
+                  'expiresAt', expires_at,
+                  'organizationId', organization_id,
+                  'storeId', store_id,
+                  'email', email,
+                  'displayName', display_name,
+                  'platformRole', role_code,
+                  'csrfTokenHash', csrf_token_hash,
+                  'rememberMe', remember_me,
+                  'lastSeenAt', last_seen_at,
+                  'absoluteExpiresAt', absolute_expires_at
+                ) from session_row
+              ), 'null'::jsonb),
+              'principal', coalesce((
+                select jsonb_build_object(
+                  'userId', session.user_id,
+                  'membershipId', principal.membership_id,
+                  'organizationId', principal.organization_id,
+                  'organizationName', principal.organization_name,
+                  'organizationSlug', principal.organization_slug,
+                  'role', principal.role,
+                  'permissions', to_jsonb(principal.permissions)
+                )
+                from principal_row principal
+                cross join session_row session
+              ), 'null'::jsonb),
+              'stores', coalesce((
+                select jsonb_agg(jsonb_build_object(
+                  'id', id,
+                  'organizationId', organization_id,
+                  'code', code,
+                  'name', name,
+                  'timezone', timezone,
+                  'currency', currency,
+                  'status', status,
+                  'storeMode', store_mode,
+                  'address', address,
+                  'phone', phone,
+                  'taxId', tax_id,
+                  'createdAt', created_at,
+                  'updatedAt', updated_at
+                ) order by created_at)
+                from store_rows
+              ), '[]'::jsonb)
+            )
+            ;
+
+            -- The first authenticated Hub read also needs the organization
+            -- dashboard. Derive the same authorized organization here so the
+            -- bootstrap and dashboard read models cross the remote boundary
+            -- in one command exchange.
+            with session_context as materialized (
+              select s.organization_id, s.user_id
+              from aevo_app_sessions s
+              join aevo_identity_users u on u.id = s.user_id and u.status = 'active'
+              where s.session_hash = @session_hash
+                and s.app_code = 'HUB'
+                and s.revoked_at is null
+                and s.expires_at > now()
+                and s.idle_expires_at > now()
+                and s.absolute_expires_at > now()
+              limit 1
+            ), principal_context as materialized (
+              select m.organization_id
+              from session_context session
+              join public.memberships m on m.user_id = session.user_id
+                and m.status = 'ACTIVE'
+                and (session.organization_id is null or m.organization_id = session.organization_id)
+              join public.organizations o on o.id = m.organization_id and o.status = 'ACTIVE'
+              join public.roles r on r.id = m.role_id
+              where exists (
+                select 1
+                from aevo_application_assignments aa
+                where aa.user_id = m.user_id
+                  and (aa.organization_id is null or aa.organization_id = m.organization_id)
+                  and aa.app_code = 'HUB'
+                  and aa.status = 'active'
+                  and aa.starts_at <= now()
+                  and (aa.expires_at is null or aa.expires_at > now())
+              )
+              order by m.created_at
+              limit 1
+            )
+            select
+              (
+                select projection
+                from aevo_hub_dashboard_projections
+                where organization_id = (select organization_id from principal_context)
+                  and store_id is null
+              ) as projection,
+              (
+                select generated_at
+                from aevo_hub_dashboard_projections
+                where organization_id = (select organization_id from principal_context)
+                  and store_id is null
+              ) as generated_at,
+              case when (select organization_id from principal_context) is null then '{}'::jsonb else
+                jsonb_build_object(
+                  'organizationId', (select organization_id from principal_context),
+                  'totalStores', (select count(*) from public.stores where organization_id = (select organization_id from principal_context) and status = 'ACTIVE'),
+                  'totalMembers', (select count(*) from public.memberships where organization_id = (select organization_id from principal_context) and status = 'ACTIVE'),
+                  'activeApps', (select count(distinct app_code) from aevo_store_application_bindings where organization_id = (select organization_id from principal_context) and status = 'ACTIVE'),
+                  'activeDevices', (select count(*) from public.devices where organization_id = (select organization_id from principal_context) and status = 'ACTIVE')
+                )
+              end as stats,
+              (
+                select coalesce(jsonb_agg(jsonb_build_object(
+                  'appCode', r.code,
+                  'label', r.name,
+                  'status', coalesce(c.status, 'not_configured'),
+                  'baseUrl', c.base_url,
+                  'checkedAt', c.checked_at,
+                  'latencyMs', c.latency_ms,
+                  'lastErrorCode', c.last_error_code,
+                  'metadata', c.metadata
+                ) order by r.code), '[]'::jsonb)
+                from aevo_application_registry r
+                left join aevo_application_connections c
+                  on c.app_code = r.code and c.environment = @environment
+              ) as connections
+            """, connection);
+        command.Parameters.AddWithValue("session_hash", SessionHash(sessionToken));
+        command.Parameters.AddWithValue("environment", environment);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken) || reader.IsDBNull(0)) return null;
+        using var document = JsonDocument.Parse(Convert.ToString(reader.GetValue(0), System.Globalization.CultureInfo.InvariantCulture) ?? "{}");
+        var root = document.RootElement;
+        var sessionElement = root.GetProperty("session");
+        if (sessionElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined) return null;
+
+        var options = new JsonSerializerOptions { PropertyNameCaseInsensitive = true };
+        var session = sessionElement.Deserialize<CoreSession>(options)
+            ?? throw new CoreDatabaseException("Hub session bootstrap returned no session.");
+        var principalElement = root.GetProperty("principal");
+        var principal = principalElement.ValueKind is JsonValueKind.Null or JsonValueKind.Undefined
+            ? null
+            : principalElement.Deserialize<HubPrincipalRecord>(options);
+        var stores = root.GetProperty("stores").Deserialize<HubStoreRecord[]>(options) ?? [];
+        var bootstrap = new HubSessionBootstrapRecord(session, principal, stores);
+
+        if (principal is null || memoryCache is null) return bootstrap;
+
+        try
+        {
+            if (!await reader.NextResultAsync(cancellationToken) || !await reader.ReadAsync(cancellationToken)) return bootstrap;
+            JsonElement? storedProjection = reader.IsDBNull(0) ? null : ParseJson(reader.GetValue(0), "{}");
+            var generatedAt = reader.IsDBNull(1) ? (DateTimeOffset?)null : reader.GetFieldValue<DateTimeOffset>(1);
+            var stats = ParseJson(reader.GetValue(2), "{}");
+            var connections = JsonSerializer.Deserialize<ApplicationConnectionRecord[]>(
+                ParseJson(reader.GetValue(3), "[]").GetRawText(),
+                HubDashboardJsonOptions) ?? [];
+            JsonElement dashboard;
+            if (storedProjection.HasValue && generatedAt.HasValue && generatedAt.Value >= DateTimeOffset.UtcNow.AddMinutes(-5))
+            {
+                dashboard = storedProjection.Value;
+            }
+            else
+            {
+                var checkedAt = connections
+                    .Where(connection => connection.CheckedAt.HasValue)
+                    .Select(connection => connection.CheckedAt!.Value)
+                    .DefaultIfEmpty(DateTimeOffset.UtcNow)
+                    .Max();
+                var partial = connections.Any(connection => connection.Status is "degraded" or "not_connected");
+                dashboard = BuildHubDashboardProjection(
+                    principal.OrganizationId,
+                    null,
+                    stats,
+                    connections,
+                    partial ? "partial" : "fresh",
+                    checkedAt,
+                    DateTimeOffset.UtcNow,
+                    partial ? "APPLICATION_CONNECTION_PARTIAL" : null);
+            }
+            // Seed the dashboard scope from the same authoritative read so a
+            // following dashboard route does not reopen the remote connection.
+            memoryCache.Put(
+                AevoCacheKeys.HubDashboardProjection(principal.OrganizationId, null),
+                dashboard,
+                TimeSpan.FromMinutes(5));
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch
+        {
+            // Dashboard warmup is an optional read model. Keep the
+            // authoritative session/bootstrap result available if its second
+            // result set cannot be consumed.
+        }
+
+        return bootstrap;
     }
 
     private async Task<CoreSession?> ResolveSessionSingleFlightAsync(
@@ -461,57 +820,50 @@ public sealed partial class CoreDataStore : IAsyncDisposable
         var expiresAt = now.AddSeconds(idleTimeoutSeconds);
         var absoluteExpiresAt = now.AddSeconds(absoluteTimeoutSeconds);
         await using var connection = await OpenConnectionAsync(cancellationToken);
-        await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-        await using (var identityCommand = new NpgsqlCommand(
+        // The three projections are transactionally coupled, but they do not
+        // need three client/server round trips. Keep transaction control in
+        // the same command as the writes so the remote pooler sees one
+        // remote PostgreSQL exchange for session issuance. The command is intentionally
+        // self-contained so a pooler cannot split the transaction boundary or
+        // make the supervisor restart path change the write semantics.
+        await using (var sessionCommand = new NpgsqlCommand(
             """
+            begin;
+
             insert into aevo_identity_users (id, email, display_name, status)
-            values (@id, @email, @display_name, 'active')
+            values (@user_id, @email, @display_name, 'active')
             on conflict (id) do update set
               email = excluded.email,
               display_name = excluded.display_name,
               status = 'active',
-              updated_at = now()
-            """, connection, transaction))
-        {
-            identityCommand.Parameters.AddWithValue("id", userId);
-            identityCommand.Parameters.AddWithValue("email", email.Trim().ToLowerInvariant());
-            identityCommand.Parameters.AddWithValue("display_name", (object?)displayName ?? DBNull.Value);
-            await identityCommand.ExecuteNonQueryAsync(cancellationToken);
-        }
+              updated_at = now();
 
-        // Keep the application-facing identity projection in sync with the
-        // provider identity. Core owns the session boundary; the legacy
-        // public profile table remains a compatibility read model until its
-        // schema is moved into the Core migration set.
-        await using (var profileCommand = new NpgsqlCommand(
-            """
+            -- Keep the application-facing identity projection in sync with
+            -- the provider identity. Core owns the session boundary; the
+            -- legacy public profile table remains a compatibility read model.
             insert into public.user_profiles (id, email, display_name, status)
-            values (@id, @email, coalesce(@display_name, ''), 'ACTIVE')
+            values (@user_id, @email, coalesce(@display_name, ''), 'ACTIVE')
             on conflict (id) do update set
               email = excluded.email,
               display_name = excluded.display_name,
               status = 'ACTIVE',
-              updated_at = now()
-            """, connection, transaction))
-        {
-            profileCommand.Parameters.AddWithValue("id", userId);
-            profileCommand.Parameters.AddWithValue("email", email.Trim().ToLowerInvariant());
-            profileCommand.Parameters.AddWithValue("display_name", (object?)displayName ?? DBNull.Value);
-            await profileCommand.ExecuteNonQueryAsync(cancellationToken);
-        }
+              updated_at = now();
 
-        await using (var sessionCommand = new NpgsqlCommand(
-            """
             insert into aevo_app_sessions
               (id, user_id, app_code, organization_id, store_id, session_hash, csrf_token_hash, expires_at, idle_expires_at, absolute_expires_at, remember_me, last_seen_at)
             values
               (@id, @user_id, @app_code, @organization_id, @store_id, @session_hash, @csrf_token_hash, @expires_at, @idle_expires_at, @absolute_expires_at, @remember_me, now())
-            """, connection, transaction))
+            ;
+
+            commit;
+            """, connection))
         {
             sessionCommand.Parameters.AddWithValue("id", sessionId);
             sessionCommand.Parameters.AddWithValue("user_id", userId);
-            sessionCommand.Parameters.AddWithValue("app_code", appCode);
+            sessionCommand.Parameters.Add(new NpgsqlParameter("app_code", NpgsqlDbType.Text) { Value = appCode });
+            sessionCommand.Parameters.Add(new NpgsqlParameter("email", NpgsqlDbType.Text) { Value = email.Trim().ToLowerInvariant() });
+            sessionCommand.Parameters.Add(new NpgsqlParameter("display_name", NpgsqlDbType.Text) { Value = (object?)displayName ?? DBNull.Value });
             sessionCommand.Parameters.Add(new NpgsqlParameter("organization_id", NpgsqlDbType.Uuid) { Value = (object?)organizationId ?? DBNull.Value });
             sessionCommand.Parameters.Add(new NpgsqlParameter("store_id", NpgsqlDbType.Uuid) { Value = (object?)storeId ?? DBNull.Value });
             sessionCommand.Parameters.AddWithValue("session_hash", SessionHash(sessionToken));
@@ -523,8 +875,34 @@ public sealed partial class CoreDataStore : IAsyncDisposable
             await sessionCommand.ExecuteNonQueryAsync(cancellationToken);
         }
 
-        await transaction.CommitAsync(cancellationToken);
-        return new IssuedCoreSession(sessionId, userId, appCode, email.Trim().ToLowerInvariant(), displayName, sessionToken, csrfToken, expiresAt, rememberMe, absoluteExpiresAt);
+        var issued = new IssuedCoreSession(sessionId, userId, appCode, email.Trim().ToLowerInvariant(), displayName, sessionToken, csrfToken, expiresAt, rememberMe, absoluteExpiresAt);
+        if (appCode == "HUB") await PrimeHubSessionBootstrapAsync(sessionToken, cancellationToken);
+        return issued;
+    }
+
+    private async Task PrimeHubSessionBootstrapAsync(string sessionToken, CancellationToken cancellationToken)
+    {
+        if (memoryCache is null) return;
+        try
+        {
+            var bootstrap = await ResolveHubSessionBootstrapAsync(sessionToken, cancellationToken);
+            if (bootstrap?.Principal is null) return;
+
+            // The Hub shell requests the organization dashboard immediately
+            // after login. Prime the same tenant-scoped read model only after
+            // the authoritative session and membership check has succeeded.
+            await GetHubDashboardProjectionAsync(
+                bootstrap.Principal.OrganizationId,
+                null,
+                environment,
+                cancellationToken);
+        }
+        catch (CoreDatabaseException)
+        {
+            // Session issuance must remain available if the optional read-model
+            // prime is unavailable. The next authenticated request retries the
+            // authoritative bootstrap read.
+        }
     }
 
     public Task<IssuedCoreSession?> RefreshSessionAsync(
@@ -799,35 +1177,54 @@ public sealed partial class CoreDataStore : IAsyncDisposable
             unlimited);
     }
 
-    public async Task<IReadOnlyList<ApplicationConnectionRecord>> ListConnectionsAsync(string environment, CancellationToken cancellationToken)
+    public Task<IReadOnlyList<ApplicationConnectionRecord>> ListConnectionsAsync(string environment, CancellationToken cancellationToken)
     {
-        await using var connection = await OpenConnectionAsync(cancellationToken);
-        await using var command = new NpgsqlCommand(
-            """
-            select r.code, r.name, coalesce(c.status, 'not_configured'), c.base_url,
-                   c.checked_at, c.latency_ms, c.last_error_code, c.metadata
-            from aevo_application_registry r
-            left join aevo_application_connections c
-              on c.app_code = r.code and c.environment = @environment
-            order by r.code
-            """, connection);
-        command.Parameters.AddWithValue("environment", environment);
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-        var result = new List<ApplicationConnectionRecord>();
-        while (await reader.ReadAsync(cancellationToken))
+        if (memoryCache is null)
         {
-            result.Add(new ApplicationConnectionRecord(
-                reader.GetString(0),
-                reader.GetString(1),
-                reader.GetString(2),
-                NullableString(reader, 3),
-                NullableDateTimeOffset(reader, 4),
-                NullableInt32(reader, 5),
-                NullableString(reader, 6),
-                JsonValue(reader, 7)));
+            return ListConnectionsFromDatabaseAsync(environment, cancellationToken);
         }
-        return result;
+
+        return memoryCache.GetOrCreateAsync(
+            AevoCacheKeys.ApplicationConnections(environment),
+            TimeSpan.FromSeconds(15),
+            ct => ListConnectionsFromDatabaseAsync(environment, ct),
+            cancellationToken);
     }
+
+    private Task<IReadOnlyList<ApplicationConnectionRecord>> ListConnectionsFromDatabaseAsync(
+        string environment,
+        CancellationToken cancellationToken)
+        => RequestPerformance.MeasureDatabaseAsync(
+            "application.connections.list",
+            async () =>
+            {
+                await using var connection = await OpenConnectionAsync(cancellationToken);
+                await using var command = new NpgsqlCommand(
+                    """
+                    select r.code, r.name, coalesce(c.status, 'not_configured'), c.base_url,
+                           c.checked_at, c.latency_ms, c.last_error_code, c.metadata
+                    from aevo_application_registry r
+                    left join aevo_application_connections c
+                      on c.app_code = r.code and c.environment = @environment
+                    order by r.code
+                    """, connection);
+                command.Parameters.AddWithValue("environment", environment);
+                await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+                var result = new List<ApplicationConnectionRecord>();
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    result.Add(new ApplicationConnectionRecord(
+                        reader.GetString(0),
+                        reader.GetString(1),
+                        reader.GetString(2),
+                        NullableString(reader, 3),
+                        NullableDateTimeOffset(reader, 4),
+                        NullableInt32(reader, 5),
+                        NullableString(reader, 6),
+                        JsonValue(reader, 7)));
+                }
+                return (IReadOnlyList<ApplicationConnectionRecord>)result;
+            });
 
     public async Task<IReadOnlyList<MigrationAuthorityRecord>> ListMigrationAuthorityAsync(CancellationToken cancellationToken)
     {
@@ -1480,7 +1877,16 @@ public sealed partial class CoreDataStore : IAsyncDisposable
 
         try
         {
-            return await dataSource.OpenConnectionAsync(cancellationToken);
+            var stopwatch = Stopwatch.StartNew();
+            try
+            {
+                return await dataSource.OpenConnectionAsync(cancellationToken);
+            }
+            finally
+            {
+                stopwatch.Stop();
+                RequestPerformance.Current?.RecordDatabaseConnectionOpen(stopwatch.Elapsed.TotalMilliseconds);
+            }
         }
         catch (Exception error)
         {
@@ -1670,6 +2076,11 @@ public sealed partial class CoreDataStore : IAsyncDisposable
     private static string? NullableString(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetString(ordinal);
     private static DateTimeOffset? NullableDateTimeOffset(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetFieldValue<DateTimeOffset>(ordinal);
     private static int? NullableInt32(NpgsqlDataReader reader, int ordinal) => reader.IsDBNull(ordinal) ? null : reader.GetInt32(ordinal);
+
+    private static int ReadBoundedInt(string? value, int fallback, int minimum, int maximum) =>
+        int.TryParse(value, out var parsed)
+            ? Math.Clamp(parsed, minimum, maximum)
+            : fallback;
 
     private static JsonElement? JsonValue(NpgsqlDataReader reader, int ordinal)
     {
