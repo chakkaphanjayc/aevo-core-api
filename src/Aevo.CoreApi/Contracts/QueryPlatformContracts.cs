@@ -55,6 +55,15 @@ public sealed record QueryModelResponse(
 
 public sealed record QueryExecutionRequest(QueryAstV1? Query);
 
+public sealed record QueryExportRequest(
+    QueryAstV1? Query,
+    IReadOnlyList<string>? SelectedFields,
+    string? Format);
+
+public sealed record QueryImportRequest(
+    string? Model,
+    string? Format);
+
 public sealed record QueryAstV1
 {
     public int Version { get; init; }

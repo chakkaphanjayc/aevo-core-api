@@ -30,7 +30,7 @@ public static partial class HubApiEndpoints
             CoreDataStore database,
             QueryPlatformService queryService) =>
         {
-            var auth = await AuthenticateAsync(context, sessions, database, true, false, "query.read");
+            var auth = await AuthenticateAsync(context, sessions, database, true, false, "store.read");
             if (auth.Failure is not null) return auth.Failure;
             if (!HasQueryModelPermission(auth.Principal!))
             {
@@ -64,7 +64,7 @@ public static partial class HubApiEndpoints
             CoreDataStore database,
             QueryPlatformService queryService) =>
         {
-            var auth = await AuthenticateAsync(context, sessions, database, true, false, "query.read");
+            var auth = await AuthenticateAsync(context, sessions, database, true, false, "store.read");
             if (auth.Failure is not null) return auth.Failure;
             if (!HasQueryModelPermission(auth.Principal!))
             {
@@ -100,7 +100,7 @@ public static partial class HubApiEndpoints
             CoreDataStore database,
             QueryPlatformService queryService) =>
         {
-            var auth = await AuthenticateAsync(context, sessions, database, true, false, "query.read");
+            var auth = await AuthenticateAsync(context, sessions, database, true, false, "store.read");
             if (auth.Failure is not null) return auth.Failure;
             if (!HasQueryModelPermission(auth.Principal!))
             {
@@ -143,6 +143,157 @@ public static partial class HubApiEndpoints
             catch (JsonException)
             {
                 return QueryFailure(context, StatusCodes.Status400BadRequest, "REQUEST_BODY_INVALID", "The query request body is invalid.");
+            }
+            catch (CoreDatabaseException error)
+            {
+                return QueryFailure(context, StatusCodes.Status503ServiceUnavailable, "CORE_API_DATABASE_UNAVAILABLE", error.Message);
+            }
+            catch (NpgsqlException)
+            {
+                return QueryFailure(context, StatusCodes.Status503ServiceUnavailable, "CORE_API_DATABASE_UNAVAILABLE", "The Core query service is unavailable.");
+            }
+        });
+
+        app.MapPost("/api/v1/query/exports", async (
+            HttpContext context,
+            AppSessionReader sessions,
+            CoreDataStore database,
+            QueryPlatformService queryService) =>
+        {
+            var auth = await AuthenticateAsync(context, sessions, database, true, true, "store.read");
+            if (auth.Failure is not null) return auth.Failure;
+            if (!HasQueryModelPermission(auth.Principal!))
+            {
+                return QueryFailure(context, StatusCodes.Status403Forbidden, "PERMISSION_REQUIRED", "The current Hub role cannot export this query model.");
+            }
+
+            try
+            {
+                var entitlement = await database.GetQueryPlatformEntitlementAsync(auth.Principal!.OrganizationId, context.RequestAborted);
+                if (!entitlement.Enabled)
+                {
+                    return QueryFailure(context, StatusCodes.Status403Forbidden, entitlement.Reason, "The organization is not entitled to use the query platform.");
+                }
+
+                var idempotencyKey = context.Request.Headers["idempotency-key"].ToString().Trim();
+                if (idempotencyKey.Length is < 8 or > 200)
+                {
+                    return QueryFailure(context, StatusCodes.Status400BadRequest, "IDEMPOTENCY_KEY_REQUIRED", "A valid Idempotency-Key header between 8 and 200 characters is required.");
+                }
+
+                var request = await ReadQueryJsonAsync<QueryExportRequest>(context);
+                if (request is null)
+                {
+                    throw new QueryPlatformContractException(
+                        "REQUEST_BODY_INVALID",
+                        "The export request body is required.",
+                        "body",
+                        StatusCodes.Status400BadRequest);
+                }
+
+                var plan = queryService.Compile(request.Query);
+                var format = request.Format?.Trim().ToUpperInvariant();
+                if (format is not ("CSV" or "JSON" or "XLSX"))
+                {
+                    throw new QueryPlatformContractException(
+                        "EXPORT_FORMAT_UNSUPPORTED",
+                        "Export format must be CSV, JSON, or XLSX.",
+                        "format");
+                }
+
+                if (request.SelectedFields is not null
+                    && (request.SelectedFields.Count == 0
+                        || request.SelectedFields.Any(field => !plan.Fields.Any(selected => string.Equals(selected.Path, field, StringComparison.Ordinal)))))
+                {
+                    throw new QueryPlatformContractException(
+                        "FIELD_NOT_ALLOWED",
+                        "Selected export fields must be present in the validated query.",
+                        "selectedFields");
+                }
+
+                return QueryFailure(
+                    context,
+                    StatusCodes.Status503ServiceUnavailable,
+                    "EXPORT_WORKER_NOT_CONFIGURED",
+                    "Core accepted the contract boundary only after validation, but no trusted export worker or private object storage is configured.");
+            }
+            catch (QueryPlatformContractException error)
+            {
+                return QueryFailure(context, error.StatusCode, error.Code, error.Message, error.Path);
+            }
+            catch (QueryRequestTooLargeException)
+            {
+                return QueryFailure(context, StatusCodes.Status413PayloadTooLarge, "QUERY_BODY_TOO_LARGE", "The export request exceeds the 64 KB request limit.");
+            }
+            catch (JsonException)
+            {
+                return QueryFailure(context, StatusCodes.Status400BadRequest, "REQUEST_BODY_INVALID", "The export request body is invalid.");
+            }
+            catch (CoreDatabaseException error)
+            {
+                return QueryFailure(context, StatusCodes.Status503ServiceUnavailable, "CORE_API_DATABASE_UNAVAILABLE", error.Message);
+            }
+            catch (NpgsqlException)
+            {
+                return QueryFailure(context, StatusCodes.Status503ServiceUnavailable, "CORE_API_DATABASE_UNAVAILABLE", "The Core query service is unavailable.");
+            }
+        });
+
+        app.MapGet("/api/v1/query/exports/{jobId}", async (
+            HttpContext context,
+            string jobId,
+            AppSessionReader sessions,
+            CoreDataStore database) =>
+        {
+            var auth = await AuthenticateAsync(context, sessions, database, true, false, "store.read");
+            if (auth.Failure is not null) return auth.Failure;
+            if (!HasQueryModelPermission(auth.Principal!))
+            {
+                return QueryFailure(context, StatusCodes.Status403Forbidden, "PERMISSION_REQUIRED", "The current Hub role cannot read export status.");
+            }
+
+            if (string.IsNullOrWhiteSpace(jobId) || jobId.Length > 128)
+            {
+                return QueryFailure(context, StatusCodes.Status400BadRequest, "EXPORT_JOB_ID_INVALID", "The export job identifier is invalid.", "jobId");
+            }
+
+            return QueryFailure(
+                context,
+                StatusCodes.Status503ServiceUnavailable,
+                "EXPORT_WORKER_NOT_CONFIGURED",
+                "Core has no trusted export worker or private object storage configured for export status.");
+        });
+
+        app.MapPost("/api/v1/query/imports", async (
+            HttpContext context,
+            AppSessionReader sessions,
+            CoreDataStore database) =>
+        {
+            var auth = await AuthenticateAsync(context, sessions, database, true, true, "organization.manage");
+            if (auth.Failure is not null) return auth.Failure;
+
+            try
+            {
+                var entitlement = await database.GetQueryPlatformEntitlementAsync(auth.Principal!.OrganizationId, context.RequestAborted);
+                if (!entitlement.Enabled)
+                {
+                    return QueryFailure(context, StatusCodes.Status403Forbidden, entitlement.Reason, "The organization is not entitled to use the query platform.");
+                }
+
+                _ = await ReadQueryJsonAsync<QueryImportRequest>(context);
+                return QueryFailure(
+                    context,
+                    StatusCodes.Status503ServiceUnavailable,
+                    "IMPORT_WORKER_NOT_CONFIGURED",
+                    "Core has no private upload storage, schema validator, or trusted import worker configured.");
+            }
+            catch (QueryRequestTooLargeException)
+            {
+                return QueryFailure(context, StatusCodes.Status413PayloadTooLarge, "QUERY_BODY_TOO_LARGE", "The import request exceeds the 64 KB request limit.");
+            }
+            catch (JsonException)
+            {
+                return QueryFailure(context, StatusCodes.Status400BadRequest, "REQUEST_BODY_INVALID", "The import request body is invalid.");
             }
             catch (CoreDatabaseException error)
             {

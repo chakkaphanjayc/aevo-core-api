@@ -17,6 +17,9 @@ public sealed class HubQueryApiEndpointTests
     [InlineData("GET", "/api/v1/query/models")]
     [InlineData("GET", "/api/v1/query/models/stores")]
     [InlineData("POST", "/api/v1/query/execute")]
+    [InlineData("POST", "/api/v1/query/exports")]
+    [InlineData("GET", "/api/v1/query/exports/job-123")]
+    [InlineData("POST", "/api/v1/query/imports")]
     public async Task QueryEndpointsRequireAnAppScopedHubSession(string method, string path)
     {
         var builder = WebApplication.CreateBuilder();
@@ -28,7 +31,11 @@ public sealed class HubQueryApiEndpointTests
         await app.StartAsync();
 
         var endpointDataSource = app.Services.GetRequiredService<EndpointDataSource>();
-        var routePattern = path == "/api/v1/query/models/stores" ? "/api/v1/query/models/{technicalName}" : path;
+        var routePattern = path == "/api/v1/query/models/stores"
+            ? "/api/v1/query/models/{technicalName}"
+            : path == "/api/v1/query/exports/job-123"
+                ? "/api/v1/query/exports/{jobId}"
+                : path;
         var route = endpointDataSource.Endpoints
             .OfType<RouteEndpoint>()
             .Single(endpoint => endpoint.RoutePattern.RawText == routePattern
@@ -40,6 +47,7 @@ public sealed class HubQueryApiEndpointTests
         context.Request.Method = method;
         context.Request.Path = path;
         if (path == "/api/v1/query/models/stores") context.Request.RouteValues["technicalName"] = "stores";
+        if (path == "/api/v1/query/exports/job-123") context.Request.RouteValues["jobId"] = "job-123";
         context.Response.Body = new MemoryStream();
 
         var requestDelegate = route.RequestDelegate ?? throw new InvalidOperationException("The test route has no request delegate.");
